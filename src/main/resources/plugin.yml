@@ -1,6 +1,6 @@
 name: NoteblockWorldMC
 version: '${project.version}'
-main: dev.example.noteblockworldmc.NoteblockWorldMCPlugin
+main: io.github.noteblockworldmc.NoteblockWorldMCPlugin
 api-version: '26.1'
 description: Browse, download, and play noteblock.world songs with note block sounds
 
