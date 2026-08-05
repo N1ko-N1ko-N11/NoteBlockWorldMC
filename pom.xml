@@ -4,7 +4,7 @@
          xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
     <modelVersion>4.0.0</modelVersion>
 
-    <groupId>dev.example</groupId>
+    <groupId>io.github.NoteBlockWorldMC</groupId>
     <artifactId>noteblockworldmc</artifactId>
     <version>1.0.0</version>
     <packaging>jar</packaging>
@@ -25,6 +25,12 @@
     </repositories>
 
     <dependencies>
+        <!--
+            Paper API for Minecraft 26.1.2.
+            The open range resolves the latest build for this MC version;
+            pin a specific one (e.g. 26.1.2.build.74-stable) for reproducible builds.
+            Gson and the Adventure text API ship with Paper at runtime.
+        -->
         <dependency>
             <groupId>io.papermc.paper</groupId>
             <artifactId>paper-api</artifactId>
