@@ -10,14 +10,16 @@ I tried it to make work as optimized as possible, though again, it was made by A
 1) This plugin fetches every upload within Noteblock.world, as such, you can search, filter and sort songs within a neat little GUI or via command. I'm keeping things thoroughly short here, because I'll add videos that demonstrate these features! Here's one for the GUI design.
 
 
-https://github.com/user-attachments/assets/acbb6d7a-f83f-4ef8-8627-4a361833a5a2
+
+https://github.com/user-attachments/assets/12be96a9-62dd-4f9c-9e1e-0a97c9deab5c
+
+
 
 And here's a video with the plugin in action!
 
 
 
-https://github.com/user-attachments/assets/f3afdc30-3df5-4bc1-bb8d-de8ad91b6028
-
+https://github.com/user-attachments/assets/1b1db728-666a-443e-93d3-5cdfbb5de09b
 
 
 
@@ -25,7 +27,7 @@ https://github.com/user-attachments/assets/f3afdc30-3df5-4bc1-bb8d-de8ad91b6028
 
 
 
-https://github.com/user-attachments/assets/1b87b5d9-183a-403c-99d2-56422b283d76
+https://github.com/user-attachments/assets/fca3197a-11dc-4420-9b86-00bbc850b1fa
 
 
 
@@ -82,6 +84,8 @@ Also self-explanatory...
 
 "/nbw volume [0-100]"
 This command allows players to set the volume of playing songs for themselves. The volumes are persistently stored in a file called "volumes.yml" for everyone that has their volume set other than 100.
+
+
 
 
 So uhh.. Have fun?.. ;w;
