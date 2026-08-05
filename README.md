@@ -11,7 +11,7 @@ I tried it to make work as optimized as possible, though again, it was made by A
 
 
 
-https://github.com/user-attachments/assets/12be96a9-62dd-4f9c-9e1e-0a97c9deab5c
+https://github.com/user-attachments/assets/fca3197a-11dc-4420-9b86-00bbc850b1fa
 
 
 
@@ -27,7 +27,7 @@ https://github.com/user-attachments/assets/1b1db728-666a-443e-93d3-5cdfbb5de09b
 
 
 
-https://github.com/user-attachments/assets/fca3197a-11dc-4420-9b86-00bbc850b1fa
+https://github.com/user-attachments/assets/12be96a9-62dd-4f9c-9e1e-0a97c9deab5c
 
 
 
