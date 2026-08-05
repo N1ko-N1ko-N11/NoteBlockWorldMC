@@ -1,0 +1,42 @@
+name: NoteblockWorldMC
+version: '1.0.0'
+main: dev.example.noteblockworldmc.NoteblockWorldMCPlugin
+api-version: '26.1'
+description: Browse, download, and play noteblock.world songs with note block sounds
+
+commands:
+  nbw:
+    description: Browse, download, and play songs from noteblock.world
+    usage: |
+      /nbw help - list the commands you can use
+      /nbw - open the song browser GUI
+      /nbw volume [0-100] - view or set your music volume
+
+permissions:
+  noteblockworldmc.importurl:
+    description: Import .nbs files from arbitrary https URLs
+    default: op
+  noteblockworldmc.browse:
+    description: Allows browsing the noteblock.world song catalog
+    default: op
+  noteblockworldmc.download:
+    description: Allows downloading songs from noteblock.world
+    default: op
+  noteblockworldmc.play:
+    description: Allows playing downloaded songs
+    default: op
+  noteblockworldmc.broadcast:
+    description: Allows playing or stopping songs for other players and everyone (@a)
+    default: op
+  noteblockworldmc.volume:
+    description: Allows players to set their personal music volume
+    default: true
+  noteblockworldmc.remove:
+    description: Allows deleting downloaded songs from the library
+    default: op
+  noteblockworldmc.config:
+    description: Allows viewing and changing settings in game with /nbw config
+    default: op
+  noteblockworldmc.reload:
+    description: Allows reloading config.yml and messages.yml
+    default: op
