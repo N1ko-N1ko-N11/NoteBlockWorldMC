@@ -23,7 +23,7 @@ https://github.com/user-attachments/assets/1b1db728-666a-443e-93d3-5cdfbb5de09b
 
 
 
-2) This plugin has an automatic resource pack building system for extended note block sounds as well as custom instruments. It requires the server IP to be set within the config.yml upon first run-- then reloading the plugin would suffice. It actually pulls custom instruments if there are any packed within the uploaded song, and adds them into a resource pack before pushing it to players.
+2) This plugin has an automatic resource pack building system for extended note block sounds as well as custom instruments. **It requires the server IP to be set within the config.yml upon first run as well as enabling resource-pack value to true, then reloading the plugin would suffice**. It also pulls custom instruments if there are any packed within the uploaded song, and adds them into the resource pack before pushing it to players.
 
 
 
