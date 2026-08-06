@@ -7,6 +7,7 @@ I tried it to make work as optimized as possible, though again, it was made by A
 
 # Serious Bits!
 This plugin, for allowing songs that have higher BPM than Minecraft's 20 tick limit to be played, uses async method to call the notes off-thread. While it can be toggled off, doing so would reduce those fast songs playback quality by clumping notes. Refer to https://github.com/N1ko-N1ko-N11/NoteBlockWorldMC/issues/2 for the reason.
+The plugin also requires the server IP to be set within the config.yml upon first run as well as enabling resource-pack value to true, then reloading the plugin would suffice.
 
 # Features
 
@@ -26,7 +27,7 @@ https://github.com/user-attachments/assets/1b1db728-666a-443e-93d3-5cdfbb5de09b
 
 
 
-2) This plugin has an automatic resource pack building system for extended note block sounds as well as custom instruments. **It requires the server IP to be set within the config.yml upon first run as well as enabling resource-pack value to true, then reloading the plugin would suffice**. It also pulls custom instruments if there are any packed within the uploaded song, and adds them into the resource pack before pushing it to players.
+2) This plugin has an automatic resource pack building system for extended note block sounds as well as custom instruments. It also pulls custom instruments if there are any packed within the uploaded song, and adds them into the resource pack before pushing it to players.
 
 
 
