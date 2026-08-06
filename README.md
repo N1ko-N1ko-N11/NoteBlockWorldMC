@@ -5,6 +5,9 @@ In short, this plugin allows people with permission (defaulted to OP, since in m
 This plugin, by default, fetches every song from https://noteblock.world, which is a site ran by the developers of OpenNBS, for Note Block Studio composer enthusiasts to share their works so others could listen to them.
 I tried it to make work as optimized as possible, though again, it was made by AI so I'm unsure if it's optimized for crowded servers... I'd appreciate input ;w;
 
+# Serious Bits!
+This plugin, for allowing songs that have higher BPM than Minecraft's 20 tick limit to be played, uses async method to call the notes off-thread. While it can be toggled off, doing so would reduce those fast songs playback quality by clumping notes. Refer to https://github.com/N1ko-N1ko-N11/NoteBlockWorldMC/issues/2 for the reason.
+
 # Features
 
 1) This plugin fetches every upload within Noteblock.world, as such, you can search, filter and sort songs within a neat little GUI or via command. I'm keeping things thoroughly short here, because I'll add videos that demonstrate these features! Here's one for the GUI design.
