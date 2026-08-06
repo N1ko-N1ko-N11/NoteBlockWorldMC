@@ -5,27 +5,33 @@ In short, this plugin allows people with permission (defaulted to OP, since in m
 This plugin, by default, fetches every song from https://noteblock.world, which is a site ran by the developers of OpenNBS, for Note Block Studio composer enthusiasts to share their works so others could listen to them.
 I tried it to make work as optimized as possible, though again, it was made by AI so I'm unsure if it's optimized for crowded servers... I'd appreciate input ;w;
 
+# Serious Bits!
+This plugin, for allowing songs that have higher BPM than Minecraft's 20 tick limit to be played, uses async method to call the notes off-thread. While it can be toggled off, doing so would reduce those fast songs playback quality by clumping notes. Refer to https://github.com/N1ko-N1ko-N11/NoteBlockWorldMC/issues/2 for the reason.
+The plugin also requires the server IP to be set within the config.yml upon first run as well as enabling resource-pack value to true, then reloading the plugin would suffice.
+
 # Features
 
 1) This plugin fetches every upload within Noteblock.world, as such, you can search, filter and sort songs within a neat little GUI or via command. I'm keeping things thoroughly short here, because I'll add videos that demonstrate these features! Here's one for the GUI design.
 
 
-https://github.com/user-attachments/assets/acbb6d7a-f83f-4ef8-8627-4a361833a5a2
+
+https://github.com/user-attachments/assets/fca3197a-11dc-4420-9b86-00bbc850b1fa
+
+
 
 And here's a video with the plugin in action!
 
 
 
-https://github.com/user-attachments/assets/f3afdc30-3df5-4bc1-bb8d-de8ad91b6028
+https://github.com/user-attachments/assets/1b1db728-666a-443e-93d3-5cdfbb5de09b
 
 
 
-
-2) This plugin has an automatic resource pack building system for extended note block sounds as well as custom instruments. It requires the server IP to be set within the config.yml upon first run-- then reloading the plugin would suffice. It actually pulls custom instruments if there are any packed within the uploaded song, and adds them into a resource pack before pushing it to players.
-
+2) This plugin has an automatic resource pack building system for extended note block sounds as well as custom instruments. It also pulls custom instruments if there are any packed within the uploaded song, and adds them into the resource pack before pushing it to players.
 
 
-https://github.com/user-attachments/assets/1b87b5d9-183a-403c-99d2-56422b283d76
+
+https://github.com/user-attachments/assets/12be96a9-62dd-4f9c-9e1e-0a97c9deab5c
 
 
 
@@ -82,6 +88,8 @@ Also self-explanatory...
 
 "/nbw volume [0-100]"
 This command allows players to set the volume of playing songs for themselves. The volumes are persistently stored in a file called "volumes.yml" for everyone that has their volume set other than 100.
+
+
 
 
 So uhh.. Have fun?.. ;w;
