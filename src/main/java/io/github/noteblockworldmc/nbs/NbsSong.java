@@ -132,7 +132,13 @@ public final class NbsSong {
         return loopEnabled;
     }
 
-    /** 0 means loop forever. */
+    /**
+     * How many times the song repeats after its first play-through.
+     *
+     * Straight from the NBS header, where OpenNBS defines it as "the amount
+     * of times to loop". 1 therefore means the song is heard twice, not once.
+     * 0 means loop forever.
+     */
     public int getMaxLoopCount() {
         return maxLoopCount;
     }

@@ -335,17 +335,10 @@ public class ResourcePackService implements Listener {
                 .getBoolean("resource-pack.download-vanilla-sounds", true)
                 && !vanillaSounds.hasAll();
 
-        try {
-            rebuild();
-            plugin.getLogger().info("Resource pack generated: "
-                    + plugin.getDataFolder().toPath().resolve("resource-pack.zip")
-                    + " (SHA-1 " + getPackSha1() + ")");
-        } catch (Exception e) {
-            plugin.getLogger().severe("Could not generate the resource pack: " + e);
-            if (fetchNeeded) fetchVanillaSoundsAsync();
-            return;
-        }
         if (!enabled) {
+            // The inspection copy is written even when the pack is switched
+            // off, but there is nobody to serve it to, so nothing to push.
+            buildPackAsync(false);
             if (fetchNeeded) fetchVanillaSoundsAsync();
             return;
         }
@@ -382,12 +375,15 @@ public class ResourcePackService implements Listener {
             httpServer.setExecutor(httpExecutor);
             httpServer.start();
             plugin.getLogger().info("Resource pack served on port " + port
-                    + " (public URL: " + publicUrl + "), SHA-1 " + getPackSha1());
-            // Covers /reload and plugin swaps: players already online never
-            // received a join-time pack send, so push it now.
-            for (Player online : plugin.getServer().getOnlinePlayers()) {
-                send(online);
-            }
+                    + " (public URL: " + publicUrl + ")");
+
+            // Binding the socket is cheap; BUILDING the pack is not -- it reads
+            // every custom sound and generates six octave variants of each, then
+            // writes the zip. Doing that inline stalled startup and every
+            // /nbw reload in proportion to library size. The server is up first
+            // and answers 503 until the bytes exist, and the push to players
+            // already online happens once the build lands.
+            buildPackAsync(true);
         } catch (Exception e) {
             plugin.getLogger().severe("Could not start the resource pack server: " + e);
             httpServer = null;
@@ -535,11 +531,10 @@ public class ResourcePackService implements Listener {
                 if (isActive()) {
                     onLibraryChanged();       // rebuild + invalidate + re-push
                 } else {
-                    try {
-                        rebuild();            // keep the inspection copy current
-                    } catch (IOException e) {
-                        plugin.getLogger().warning("Resource pack rebuild failed: " + e);
-                    }
+                    // Off-thread for the same reason as startup: this lands
+                    // after a vanilla-sound download, so the pack is being
+                    // built from scratch and is at its most expensive.
+                    buildPackAsync(false);
                 }
             });
         });
@@ -690,6 +685,47 @@ public class ResourcePackService implements Listener {
         Files.write(packFile, bytes);
     }
 
+    /**
+     * Builds the pack on a worker thread and publishes the result on the main
+     * thread.
+     *
+     * Mirrors what doRebuildAndPush already does for runtime library changes;
+     * startup was the one path still doing this work inline.
+     *
+     * @param pushWhenDone send the finished pack to everyone already online,
+     *                     which matters for /reload and plugin swaps where no
+     *                     join event will fire
+     */
+    private void buildPackAsync(boolean pushWhenDone) {
+        org.bukkit.Bukkit.getScheduler().runTaskAsynchronously(plugin, () -> {
+            boolean built;
+            try {
+                rebuild();
+                built = true;
+            } catch (Exception e) {
+                plugin.getLogger().severe("Could not generate the resource pack: " + e);
+                built = false;
+            }
+            boolean success = built;
+
+            // The plugin can be disabled while this is in flight (a fast
+            // stop, or a reload that swaps it out); scheduling onto a
+            // disabled plugin throws.
+            if (!plugin.isEnabled()) return;
+            org.bukkit.Bukkit.getScheduler().runTask(plugin, () -> {
+                if (!success) return;
+                plugin.getLogger().info("Resource pack generated: "
+                        + plugin.getDataFolder().toPath().resolve("resource-pack.zip")
+                        + " (SHA-1 " + getPackSha1() + ")");
+                if (pushWhenDone && isActive()) {
+                    for (Player online : plugin.getServer().getOnlinePlayers()) {
+                        send(online);
+                    }
+                }
+            });
+        });
+    }
+
     /** Sends the required pack to a player. */
     public void send(Player player) {
         PackData current = pack;
@@ -769,18 +805,34 @@ public class ResourcePackService implements Listener {
 
     /**
      * Sound event key (without namespace) for a song's custom sound file:
-     * "song.&lt;sanitizedId&gt;.&lt;sanitizedBase&gt;". Playback and pack
+     * "song.&lt;sanitizedId&gt;.&lt;sanitizedPath&gt;". Playback and pack
      * generation both derive names through here, so they can never drift.
      */
     public static String customSoundEvent(String publicId, String soundFile) {
-        return "song." + sanitizeKeyPart(publicId) + "." + sanitizeKeyPart(baseName(soundFile));
+        return "song." + sanitizeKeyPart(publicId) + "." + sanitizeKeyPart(soundKeyPart(soundFile));
     }
 
-    /** File name without directories or the .ogg extension. */
-    public static String baseName(String soundFile) {
+    /**
+     * The identifying part of a custom sound path: the whole relative path,
+     * minus the .ogg extension, with separators normalised.
+     *
+     * The directories are deliberately KEPT. NBS v5 lets a song reference
+     * sounds in subfolders, so "drums/kick.ogg" and "effects/kick.ogg" are two
+     * different sounds; reducing both to "kick" gave them the same event, and
+     * the duplicate guard in the pack builder then dropped the second one
+     * silently -- the song played with one of its instruments missing and
+     * nothing said why.
+     *
+     * sanitizeKeyPart later turns the separator into an underscore and, since
+     * that transform is lossy, appends a hash of the original. So "drums/kick"
+     * and a literal "drums_kick" stay distinct too.
+     */
+    public static String soundKeyPart(String soundFile) {
         String name = soundFile.replace('\\', '/');
-        int slash = name.lastIndexOf('/');
-        if (slash >= 0) name = name.substring(slash + 1);
+        // Leading "./" or "/" carry no meaning here and would otherwise make
+        // two spellings of one path look like different sounds.
+        while (name.startsWith("./")) name = name.substring(2);
+        while (name.startsWith("/")) name = name.substring(1);
         if (name.toLowerCase(Locale.ROOT).endsWith(".ogg")) {
             name = name.substring(0, name.length() - 4);
         }
@@ -977,13 +1029,23 @@ public class ResourcePackService implements Listener {
                 budget -= bytes.length;
                 fileCount++;
 
-                String event = customSoundEvent(publicId, file.getFileName().toString());
+                // Relative to the song's sounds folder, so a file in a
+                // subdirectory keeps the directory in its key. Passing only
+                // getFileName() here was what made two same-named files in
+                // different folders collapse onto one event.
+                String relative = soundsDir.relativize(file).toString();
+                String event = customSoundEvent(publicId, relative);
                 String path = "songs/" + sanitizeKeyPart(publicId) + "/"
-                        + sanitizeKeyPart(baseName(file.getFileName().toString()));
+                        + sanitizeKeyPart(soundKeyPart(relative));
 
-                // Two files sanitizing to the same name would make
+                // Distinct paths now yield distinct events, so this should no
+                // longer fire; it stays because a duplicate would make
                 // ZipOutputStream throw and kill the entire rebuild.
-                if (!events.add(event)) continue;
+                if (!events.add(event)) {
+                    plugin.getLogger().warning("Two custom sounds in " + publicId
+                            + " map to the same event (" + event + "); skipping " + relative);
+                    continue;
+                }
 
                 zip.putNextEntry(new ZipEntry("assets/nbw/sounds/" + path + ".ogg"));
                 zip.write(bytes);

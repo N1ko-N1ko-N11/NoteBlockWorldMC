@@ -1430,7 +1430,12 @@ public class PlaybackManager implements Listener {
             // An empty song would otherwise "loop" every step forever
             if (song.getLengthTicks() <= 0) return false;
             int max = song.getMaxLoopCount();
-            return max == 0 || loopsDone + 1 < max;   // 0 = loop forever
+            // The NBS field is the number of times the song LOOPS, not the
+            // number of times it plays: OpenNBS documents it as "the amount of
+            // times to loop, 0 = infinite". So a count of 1 means one repeat
+            // (two plays through). Comparing loopsDone + 1 lost exactly one
+            // repeat at every finite count, and made a count of 1 do nothing.
+            return max == 0 || loopsDone < max;      // 0 = loop forever
         }
 
         /** Jumps back to the song's loop start, restoring the tempo there. */
