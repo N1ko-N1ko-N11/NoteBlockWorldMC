@@ -7,7 +7,7 @@ I tried it to make work as optimized as possible, though again, it was made by A
 
 # Serious Bits!
 This plugin, for allowing songs that have higher BPM than Minecraft's 20 tick limit to be played, uses async method to call the notes off-thread. While it can be toggled off, doing so would reduce those fast songs playback quality by clumping notes. Refer to https://github.com/N1ko-N1ko-N11/NoteBlockWorldMC/issues/2 for the reason.
-**The plugin also requires the server IP to be set within the config.yml upon first run as well as enabling resource-pack value to true, then reloading the plugin would suffice.**
+**The plugin requires 8194 (or the port you've set up in the config file) open, it also requires the server IP to be set within the config.yml upon first run as well as enabling resource-pack value to true, then reloading the plugin would suffice.**
 
 # Features
 
