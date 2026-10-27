@@ -18,11 +18,11 @@ import java.util.TreeMap;
 /**
  * Parser for the .nbs (Note Block Studio) binary format.
  * Supports the classic format (version 0) and OpenNBS versions 1-6.
- * Format reference: https://opennbs.org/nbs
- *
+ * Format reference: <a href="https://opennbs.org/nbs">opennbs.org/nbs</a>
+ * <p>
  * All multi-byte values in NBS are little-endian; DataInputStream is
  * big-endian, hence the readShortLE/readIntLE helpers.
- *
+ * <p>
  * Pitch/volume are precomputed here so playback is a dumb loop:
  *  - effective key = key + finePitch/100 (v4+ fine pitch is in cents)
  *  - transposed by octaves into the note block range (keys 33-57,
@@ -183,10 +183,10 @@ public final class NbsParser {
                 readString(in);                     // layer name
                 if (version >= 4) in.readByte();    // lock
                 int volume = in.readUnsignedByte();
-                if (i < layerVolumes.length) layerVolumes[i] = volume;
+                layerVolumes[i] = volume;
                 if (version >= 2) {
                     int stereo = in.readUnsignedByte();
-                    if (i < layerStereo.length) layerStereo[i] = stereo;
+                    layerStereo[i] = stereo;
                 }
             }
         } catch (IOException ignored) {
@@ -200,7 +200,7 @@ public final class NbsParser {
         // First index that counts as a custom instrument. The header's own
         // vanilla-instrument-count field participates, capped by what the
         // format version can actually declare (guards malicious headers).
-        int firstCustomIndex = Math.min(Math.max(vanillaInstrumentCount, 0),
+        int firstCustomIndex = Math.min(vanillaInstrumentCount,
                 version >= 6 ? BUILTINS_V6 : BUILTINS_PRE_V6);
 
         // ---- Custom instruments (optional section after layers) ----
@@ -257,7 +257,7 @@ public final class NbsParser {
                     customKeys.add(soundKey <= 87 ? soundKey : 45);
                     continue;
                 }
-                customSoundFiles.add(soundFile == null ? "" : soundFile.trim());
+                customSoundFiles.add(soundFile.trim());
                 // 0-87; anything else is malformed -> fall back to F#4
                 customKeys.add(soundKey <= 87 ? soundKey : 45);
             }
@@ -322,7 +322,7 @@ public final class NbsParser {
             }
             int layerVolume = raw.layer() >= 0 && raw.layer() < layerVolumes.length
                     ? layerVolumes[raw.layer()] : 100;
-            float volume = clamp((raw.velocity() / 100f) * (layerVolume / 100f), 0f, 1f);
+            float volume = Math.clamp((raw.velocity() / 100f) * (layerVolume / 100f), 0f, 1f);
             if (volume <= 0f) continue;
 
             // A promoted trumpet uses the vanilla sample's reference key,
@@ -361,7 +361,7 @@ public final class NbsParser {
             }
             // The pack ships +-3 octaves (full 88-key piano); fine-pitch
             // abuse beyond that stays folded at the clamped variant.
-            octave = Math.max(-3, Math.min(3, octave));
+            octave = Math.clamp(octave, -3, 3);
             float pitch = (float) Math.pow(2, (effectiveKey - baseKey) / 12.0);
 
             // Panning: note and layer are both 0-200 with 100 = centre.
@@ -371,10 +371,10 @@ public final class NbsParser {
             int stereo = (raw.layer() >= 0 && raw.layer() < layerStereo.length
                     ? layerStereo[raw.layer()] : 100) - 100;
             int resolvedPan = stereo == 0 ? notePan : (notePan + stereo) / 2;
-            float pan = Math.max(-1f, Math.min(1f, resolvedPan / 100f));
+            float pan = Math.clamp(resolvedPan / 100f, -1f, 1f);
 
             List<PlayableNote> tickNotes =
-                    notesByTick.computeIfAbsent(raw.tick(), t -> new ArrayList<>());
+                    notesByTick.computeIfAbsent(raw.tick(), _ -> new ArrayList<>());
 
             // Coalesce an identical note already on this tick. NBS arrangements
             // routinely stack the SAME note across layers purely to make it
@@ -464,9 +464,5 @@ public final class NbsParser {
         byte[] bytes = new byte[length];
         in.readFully(bytes);
         return new String(bytes, StandardCharsets.UTF_8);
-    }
-
-    private static float clamp(float value, float min, float max) {
-        return Math.max(min, Math.min(max, value));
     }
 }

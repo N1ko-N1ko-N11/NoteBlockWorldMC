@@ -1,7 +1,7 @@
 package io.github.noteblockworldmc.pack;
 
 /** Bounded Vorbis I setup reader. No PCM buffers or codebook lookup tables are allocated.
- * Format reference: https://xiph.org/vorbis/doc/Vorbis_I_spec.html
+ * Format reference: <a href="https://xiph.org/vorbis/doc/Vorbis_I_spec.html">Vorbis I specification</a>
  * This validates decoder configuration, not the synthesis of every audio sample.
  */
 final class VorbisSetup {

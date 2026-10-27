@@ -3,10 +3,8 @@ package io.github.noteblockworldmc.api;
 import com.google.gson.Gson;
 import com.google.gson.reflect.TypeToken;
 import io.github.noteblockworldmc.api.model.SongPage;
-import io.github.noteblockworldmc.download.SecureUrlFetcher;
 
 import java.net.URI;
-import java.io.IOException;
 import java.net.URLEncoder;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
@@ -16,24 +14,20 @@ import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.RejectedExecutionException;
-import java.util.concurrent.ThreadPoolExecutor;
-import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
 /**
  * Thin async wrapper around the Note Block World REST API.
- *
+ * <p>
  * All methods return CompletableFutures that complete on HttpClient's
  * executor threads — NEVER touch the Bukkit API directly in a callback;
  * hop back to the main thread first (see SongsCommand for an example).
- *
+ * <p>
  * Endpoints (base URL has a /v1 prefix, configurable in config.yml):
  *   GET /song              -> paginated song list (q, sort, order, category, page, limit)
  *   GET /song/categories   -> { "pop": 42, "rock": 38, ... } (cached; see below)
  *   GET /song/{id}/open    -> the signed URL to fetch a song's zip from
- *
+ * <p>
  * Two things keep the load on a small volunteer-run service reasonable:
  * categories are fetched once at startup and only again on /nbw reload, and a
  * 429 or 503 puts the client into a cooldown during which requests fail
@@ -167,17 +161,7 @@ public class NoteBlockWorldClient {
 
     private final String userAgent;
     private final String baseUrl;
-    private final HttpClient httpClient;
     private final io.github.noteblockworldmc.util.BoundedHttp bounded;
-    /** Direct file downloads use the pinned-address fetcher, with bounded admission. */
-    private final ThreadPoolExecutor secureDownloads = new ThreadPoolExecutor(0, 4, 30,
-            TimeUnit.SECONDS, new java.util.concurrent.SynchronousQueue<>(), r -> {
-        Thread t = new Thread(r, "NoteblockWorldMC-download");
-        t.setDaemon(true);
-        return t;
-    }, new ThreadPoolExecutor.AbortPolicy());
-    private final java.util.Set<SecureUrlFetcher> activeSecureDownloads =
-            ConcurrentHashMap.newKeySet();
     private final Duration requestTimeout;
     private final Gson gson = new Gson();
 
@@ -207,7 +191,7 @@ public class NoteBlockWorldClient {
         // plugin moved on — a version string that lies is worse than none.
         this.userAgent = "NoteblockWorldMC-MinecraftPlugin/" + pluginVersion;
         this.requestTimeout = requestTimeout;
-        this.httpClient = HttpClient.newBuilder()
+        HttpClient httpClient = HttpClient.newBuilder()
                 .connectTimeout(connectTimeout)
                 .followRedirects(HttpClient.Redirect.NORMAL)
                 .build();
@@ -238,9 +222,9 @@ public class NoteBlockWorldClient {
         }
         params.put("page", String.valueOf(Math.max(1, query.getPage())));
         // The API validates limit with @Max(100); clamp so we never send an invalid value
-        params.put("limit", String.valueOf(Math.min(100, Math.max(1, query.getLimit()))));
+        params.put("limit", String.valueOf(Math.clamp(query.getLimit(), 1, 100)));
 
-        return getJson("/song" + toQueryString(params), SongPage.class).thenApply(page -> {
+        return getSongPage("/song" + toQueryString(params)).thenApply(page -> {
             if (page == null) throw new ApiException("API returned an empty song page");
             page.getContent(); // validate records before handing the page to consumers
             return page;
@@ -249,7 +233,7 @@ public class NoteBlockWorldClient {
 
     /**
      * When a server-imposed cooldown expires, as System.nanoTime(); 0 = none.
-     *
+     * <p>
      * noteblock.world is a small volunteer service, and a plugin that keeps
      * asking while being told to stop is the difference between heavy traffic
      * and making an outage worse. Requests are refused locally until this
@@ -267,7 +251,7 @@ public class NoteBlockWorldClient {
     /**
      * Category list, fetched once at startup and only re-fetched on
      * /nbw reload.
-     *
+     * <p>
      * The categories are a near-static list -- they change when the site adds
      * one, not while a server is running -- so refetching them every time an
      * admin opens the browser was a call per GUI open for nothing. Caching on
@@ -287,7 +271,7 @@ public class NoteBlockWorldClient {
 
     /**
      * Discards the cached categories and fetches them again.
-     *
+     * <p>
      * Called at startup and from /nbw reload, so the cache has exactly two
      * moments where it can change and an admin can always force one.
      */
@@ -298,7 +282,7 @@ public class NoteBlockWorldClient {
         // A failed fetch must not become a permanently cached failure: clear
         // the slot so the next caller retries (the backoff above still stops
         // that from turning into a hammer).
-        fresh.whenComplete((value, error) -> {
+        fresh.whenComplete((_, error) -> {
             if (error != null && categoryCache == fresh) categoryCache = null;
         });
         return fresh;
@@ -349,7 +333,7 @@ public class NoteBlockWorldClient {
     /**
      * Resolves the signed download URL for a song's packed zip
      * (song.nbs + custom instrument sounds).
-     *
+     * <p>
      * Mirrors the website's "Open in NBS" button: GET /song/{id}/open with
      * the header "src: downloadButton" (the API rejects the request with 401
      * "Invalid source" otherwise). The response body is the URL as plain text.
@@ -397,49 +381,10 @@ public class NoteBlockWorldClient {
                 });
     }
 
-    /**
-     * Downloads a file (e.g. the signed Backblaze URL from fetchOpenUrl)
-     * into memory, enforcing a size cap.
-     */
-    public CompletableFuture<byte[]> downloadFile(String url, long maxBytes) {
-        if (url == null || url.isBlank()) return CompletableFuture.failedFuture(
-                new IllegalArgumentException("A download URL is required"));
-        if (maxBytes <= 0) return CompletableFuture.failedFuture(
-                new IllegalArgumentException("Download size limit must be positive"));
-        // The signed URL is untrusted. The general HttpClient follows redirects
-        // and resolves DNS independently of validation, so it cannot safely be
-        // used for this hop. SecureUrlFetcher validates and pins every address
-        // on the socket that receives the bytes.
-        SecureUrlFetcher fetcher = new SecureUrlFetcher(maxBytes);
-        activeSecureDownloads.add(fetcher);
-        CompletableFuture<byte[]> result;
-        try {
-            result = CompletableFuture.supplyAsync(() -> {
-                try {
-                    return fetcher.fetch(url);
-                } catch (IOException e) {
-                    throw new java.util.concurrent.CompletionException(e);
-                } finally {
-                    activeSecureDownloads.remove(fetcher);
-                    fetcher.close();
-                }
-            }, secureDownloads);
-        } catch (RejectedExecutionException e) {
-            activeSecureDownloads.remove(fetcher);
-            fetcher.close();
-            return CompletableFuture.failedFuture(new IOException(
-                    "Download service busy or stopped; try again shortly", e));
-        }
-        result.whenComplete((value, error) -> {
-            if (result.isCancelled()) fetcher.close();
-        });
-        return result;
-    }
-
     // ------------------------------------------------------------------
 
-    private <T> CompletableFuture<T> getJson(String path, Class<T> type) {
-        return getJsonRaw(path).thenApply(body -> gson.fromJson(body, type));
+    private CompletableFuture<SongPage> getSongPage(String path) {
+        return getJsonRaw(path).thenApply(body -> gson.fromJson(body, SongPage.class));
     }
 
     private CompletableFuture<String> getJsonRaw(String path) {
@@ -483,7 +428,7 @@ public class NoteBlockWorldClient {
 
     /**
      * Fails immediately, without sending anything, while a cooldown is active.
-     *
+     * <p>
      * This is the part that actually protects the API: the error screen in the
      * browser doubles as a retry button, so without a local gate an admin
      * clicking it repeatedly during an outage would send a request every time.
@@ -499,7 +444,7 @@ public class NoteBlockWorldClient {
 
     /**
      * Records the cooldown a 429/503 asked for and builds the message shown.
-     *
+     * <p>
      * Retry-After may be a number of seconds or an HTTP date; both are
      * accepted, and anything unparseable falls back to a conservative default
      * rather than being ignored.
@@ -508,7 +453,7 @@ public class NoteBlockWorldClient {
         long seconds = response.headers().firstValue("Retry-After")
                 .map(NoteBlockWorldClient::parseRetryAfter)
                 .orElse(DEFAULT_BACKOFF_SECONDS);
-        seconds = Math.max(1, Math.min(MAX_BACKOFF_SECONDS, seconds));
+        seconds = Math.clamp(seconds, 1, MAX_BACKOFF_SECONDS);
         long now = System.nanoTime();
         long delay = seconds * 1_000_000_000L;
         long remaining = rateLimitedUntilNanos == 0 ? 0 : rateLimitedUntilNanos - now;
@@ -550,8 +495,6 @@ public class NoteBlockWorldClient {
     /** Releases the HTTP client's threads (call on plugin disable). */
     public void close() {
         bounded.close();
-        activeSecureDownloads.forEach(SecureUrlFetcher::close);
-        secureDownloads.shutdownNow();
     }
 
     /** Retires this client after pending requests complete, without blocking reload. */
@@ -563,10 +506,6 @@ public class NoteBlockWorldClient {
     public static class ApiException extends RuntimeException {
         public ApiException(String message) {
             super(message);
-        }
-
-        public ApiException(String message, Throwable cause) {
-            super(message, cause);
         }
     }
 }

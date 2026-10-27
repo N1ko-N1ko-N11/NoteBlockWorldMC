@@ -35,13 +35,13 @@ public final class ConfigEditor {
 
     /**
      * One editable setting.
-     *
+     * <p>
      * {@code min}/{@code max} mirror the clamps the plugin applies when it
      * reads the value. They exist so the command can REJECT an out-of-range
      * value: silently clamping would leave config.yml disagreeing with the
      * plugin's behaviour, and the admin with no idea why.
      */
-    public record Option(String path, Kind kind, double min, double max, String note) {
+    public record Option(String path, Kind kind, double min, double max) {
 
         /** Trailing part of the path, which is what admins actually type. */
         public String shortName() {
@@ -65,39 +65,39 @@ public final class ConfigEditor {
 
     private static final Map<String, Option> BY_PATH = new LinkedHashMap<>();
 
-    private static void add(String path, Kind kind, double min, double max, String note) {
-        BY_PATH.put(path, new Option(path, kind, min, max, note));
+    private static void add(String path, Kind kind, double min, double max) {
+        BY_PATH.put(path, new Option(path, kind, min, max));
     }
 
     static {
         // ---- playback: every one of these is re-read by loadHotSettings() ----
-        add("playback.show-actionbar", Kind.BOOLEAN, 0, 1, "");
-        add("playback.actionbar-length", Kind.INTEGER, 4, 40, "");
-        add("playback.respect-loop", Kind.BOOLEAN, 0, 1, "");
-        add("playback.high-precision", Kind.BOOLEAN, 0, 1, "");
-        add("playback.precision-ms", Kind.INTEGER, 2, 25, "");
-        add("playback.soft-limiter", Kind.BOOLEAN, 0, 1, "");
+        add("playback.show-actionbar", Kind.BOOLEAN, 0, 1);
+        add("playback.actionbar-length", Kind.INTEGER, 4, 40);
+        add("playback.respect-loop", Kind.BOOLEAN, 0, 1);
+        add("playback.high-precision", Kind.BOOLEAN, 0, 1);
+        add("playback.precision-ms", Kind.INTEGER, 2, 25);
+        add("playback.soft-limiter", Kind.BOOLEAN, 0, 1);
         // The plugin enforces only a lower bound here; the upper limit is this
         // command's own sanity check, since a chord cannot exceed the parser's
         // 128-notes-per-tick cap anyway.
-        add("playback.limiter-threshold", Kind.INTEGER, 2, 128, "");
-        add("playback.audible-floor", Kind.DECIMAL, 0, 1, "");
-        add("playback.fade-out-ms", Kind.INTEGER, 0, 5000, "");
-        add("playback.voice-allocation", Kind.BOOLEAN, 0, 1, "");
-        add("playback.client-channels", Kind.INTEGER, 16, 8192, "");
+        add("playback.limiter-threshold", Kind.INTEGER, 2, 128);
+        add("playback.audible-floor", Kind.DECIMAL, 0, 1);
+        add("playback.fade-out-ms", Kind.INTEGER, 0, 5000);
+        add("playback.voice-allocation", Kind.BOOLEAN, 0, 1);
+        add("playback.client-channels", Kind.INTEGER, 16, 8192);
         // Clamped again to client-channels when read, so a value above the
         // configured pool is accepted here but takes effect as the pool size.
-        add("playback.voice-ceiling", Kind.INTEGER, 16, 8192, "");
-        add("playback.humanize", Kind.BOOLEAN, 0, 1, "");
-        add("playback.humanize-timing-ms", Kind.DECIMAL, 0, 50, "");
-        add("playback.humanize-velocity", Kind.DECIMAL, 0, 0.5, "");
-        add("playback.humanize-drift", Kind.DECIMAL, 0, 1, "");
-        add("playback.humanize-percussion-factor", Kind.DECIMAL, 0, 1, "");
-        add("playback.follow-player", Kind.BOOLEAN, 0, 1, "");
+        add("playback.voice-ceiling", Kind.INTEGER, 16, 8192);
+        add("playback.humanize", Kind.BOOLEAN, 0, 1);
+        add("playback.humanize-timing-ms", Kind.DECIMAL, 0, 50);
+        add("playback.humanize-velocity", Kind.DECIMAL, 0, 0.5);
+        add("playback.humanize-drift", Kind.DECIMAL, 0, 1);
+        add("playback.humanize-percussion-factor", Kind.DECIMAL, 0, 1);
+        add("playback.follow-player", Kind.BOOLEAN, 0, 1);
         // Only has an effect while follow-player is false: an attached sound
         // has no world position to offset for stereo.
-        add("playback.stereo-panning", Kind.BOOLEAN, 0, 1, "");
-        add("playback.pan-distance", Kind.DECIMAL, 0.1, 8.0, "");
+        add("playback.stereo-panning", Kind.BOOLEAN, 0, 1);
+        add("playback.pan-distance", Kind.DECIMAL, 0.1, 8.0);
     }
 
     private ConfigEditor() {
@@ -110,7 +110,7 @@ public final class ConfigEditor {
     /**
      * Looks up a setting by full path ("playback.precision-ms") or by its short
      * name ("precision-ms"), case-insensitively.
-     *
+     * <p>
      * Short names are unambiguous across the editable set; a name that ever
      * collided would resolve to nothing rather than guess a section.
      */
@@ -202,7 +202,7 @@ public final class ConfigEditor {
 
     /** Renders a value the way it should appear in YAML and in chat. */
     public static String render(Object value) {
-        if (value instanceof Boolean bool) return bool ? "true" : "false";
+        if (value instanceof Boolean bool) return bool.toString();
         if (value instanceof Double dbl) return formatNumber(dbl);
         return String.valueOf(value);
     }
@@ -225,7 +225,7 @@ public final class ConfigEditor {
 
         /**
          * The first paragraph of the comment block.
-         *
+         * <p>
          * These blocks are written as a short summary, then a blank {@code #}
          * line, then the detail -- and the longest run to 21 lines, which would
          * bury a Minecraft chat window. Showing the leading paragraph gives the
@@ -251,12 +251,12 @@ public final class ConfigEditor {
     /**
      * Finds a setting's line in config.yml, together with the comment block
      * directly above it.
-     *
+     * <p>
      * The comments ARE the documentation for these settings, so surfacing them
      * through {@code /nbw config <setting>} keeps one source of truth rather
      * than duplicating every explanation into messages.yml where the two would
      * drift apart.
-     *
+     * <p>
      * Returns null when the file has no such key, which happens on servers
      * whose config.yml predates a setting -- worth reporting rather than
      * silently writing nothing.
@@ -320,7 +320,7 @@ public final class ConfigEditor {
             if (!trimmed.startsWith("#")) break;
             String text = trimmed.substring(1);
             if (text.startsWith(" ")) text = text.substring(1);
-            out.add(0, text);
+            out.addFirst(text);
         }
         return out;
     }
@@ -331,7 +331,7 @@ public final class ConfigEditor {
 
     /**
      * Replaces one setting's line while preserving surrounding settings and comments.
-     *
+     * <p>
      * Written to a sibling temp file and moved into place, so a crash midway
      * cannot leave a half-written config.yml -- the plugin would refuse to load
      * on the next start.

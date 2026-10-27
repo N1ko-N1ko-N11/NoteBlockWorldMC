@@ -23,7 +23,7 @@ public final class BoundedHttp implements AutoCloseable {
         if (closed || !permits.tryAcquire()) return CompletableFuture.failedFuture(
                 new IOException("HTTP service busy or stopped; try again shortly"));
         CompletableFuture<HttpResponse<byte[]>> wire;
-        try { wire = client.sendAsync(request, info -> new CappedBody(limit)); }
+        try { wire = client.sendAsync(request, _ -> new CappedBody(limit)); }
         catch (RuntimeException e) { permits.release(); return CompletableFuture.failedFuture(e); }
         requests.add(wire);
         CompletableFuture<HttpResponse<byte[]>> result = new CompletableFuture<>();
@@ -35,7 +35,7 @@ public final class BoundedHttp implements AutoCloseable {
             timer.cancel(false); requests.remove(wire); permits.release();
             if (error == null) result.complete(response); else result.completeExceptionally(error);
         });
-        result.whenComplete((r, e) -> { if (result.isCancelled()) wire.cancel(true); });
+        result.whenComplete((_, _) -> { if (result.isCancelled()) wire.cancel(true); });
         if (closed) wire.cancel(true);
         return result;
     }
@@ -51,7 +51,7 @@ public final class BoundedHttp implements AutoCloseable {
         private final ByteArrayOutputStream out = new ByteArrayOutputStream();
         private final long limit;
         private Flow.Subscription subscription;
-        CappedBody(long limit) { this.limit = Math.max(0, Math.min(limit, Integer.MAX_VALUE - 8)); }
+        CappedBody(long limit) { this.limit = Math.clamp(limit, 0, Integer.MAX_VALUE - 8); }
         public CompletionStage<byte[]> getBody() { return body; }
         public void onSubscribe(Flow.Subscription value) { subscription = value; value.request(1); }
         public void onNext(List<ByteBuffer> buffers) {

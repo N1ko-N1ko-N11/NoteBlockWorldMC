@@ -18,9 +18,7 @@ import org.bukkit.event.player.PlayerQuitEvent;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
-import java.nio.file.Path;
 import java.util.ArrayList;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -30,16 +28,16 @@ import java.util.function.Consumer;
 
 /**
  * Plays parsed NBS songs using note block sounds.
- *
+ * <p>
  * Two session kinds:
  *  - PERSONAL: one per player, heard only by that listener.
  *  - BROADCAST: at most one server-wide, heard by everyone who can hear it.
- *
+ * <p>
  * A live broadcast takes precedence: a player's personal session goes silent
  * while one is running, keeps advancing in the background, and is audible
  * again the moment the broadcast ends. Late joiners hear the remainder of a
  * broadcast automatically.
- *
+ * <p>
  * Timing comes from a dedicated clock thread stepping every
  * playback.precision-ms (default 2ms), not from the game tick, because a song
  * tick at NBS tempos rarely divides evenly into Minecraft's 50ms and fast
@@ -76,7 +74,7 @@ public class PlaybackManager implements Listener {
 
     /**
      * Extended-octave sound keys from the server resource pack:
-     * [instrument][octave + 3] -> "nbw:<name>_m3".."nbw:<name>_p3"
+     * [instrument][octave + 3] -> {@code "nbw:<name>_m3".."nbw:<name>_p3"}
      * (octave 0 uses the vanilla Sound above and stays null here).
      */
     private static final String[][] EXTENDED_SOUND_KEYS =
@@ -168,7 +166,7 @@ public class PlaybackManager implements Listener {
         if (request != null) completeRequest(request);
     }
     private void completeRequest(PlayRequest request) {
-        pendingSelections.computeIfPresent(selectionKey(request), (key, selection) ->
+        pendingSelections.computeIfPresent(selectionKey(request), (_, selection) ->
                 selection.request.equals(request) ? null : selection);
         if (request.broadcast()) { if (request.equals(broadcastRequest)) broadcastRequest = null; }
         else playRequests.remove(request.listener(), request);
@@ -189,7 +187,7 @@ public class PlaybackManager implements Listener {
      * second, so tick-driven playback quantises every note to a 50 ms grid —
      * a 40 t/s song arrives as clusters of two notes instead of an even run.
      * This thread steps every session every few milliseconds instead.
-     *
+     * <p>
      * It touches NOTHING from the Bukkit world: each session publishes a
      * listener snapshot (positions, volumes, pack state) from the main thread
      * once per tick, and the clock only reads that and emits sound packets.
@@ -205,12 +203,12 @@ public class PlaybackManager implements Listener {
     public static float configuredAudibleFloor(NoteblockWorldMCPlugin plugin) {
         double configured = plugin.getConfig().getDouble("playback.audible-floor", DEFAULT_AUDIBLE_FLOOR);
         if (!Double.isFinite(configured)) return DEFAULT_AUDIBLE_FLOOR;
-        return (float) Math.max(0d, Math.min(1d, configured));
+        return (float) Math.clamp(configured, 0d, 1d);
     }
 
     /**
      * Milliseconds spent ramping down when a song is stopped; 0 = hard cut.
-     *
+     * <p>
      * Minecraft cannot alter the volume of a sound that is already playing,
      * so the ramp itself only quietens notes STRUCK during the window. What
      * makes the fade audible is that the session then ends WITHOUT cutting
@@ -246,12 +244,12 @@ public class PlaybackManager implements Listener {
 
     /**
      * Attach notes to the listener instead of placing them in the world.
-     *
+     * <p>
      * A world-placed note is pinned to where it was played, and the game keeps
      * recomputing its volume and direction as you move -- so every ringing note
      * fades and swings around you while you walk or fly. Attaching the sound to
      * the player removes that: the note travels with you.
-     *
+     * <p>
      * Trade-off: Minecraft cannot pan an attached sound (stereo exists only
      * because a sound has a POSITION to be offset from), so panning is off in
      * this mode.
@@ -264,7 +262,7 @@ public class PlaybackManager implements Listener {
     private volatile Playback broadcastSession;
     /**
      * Songs waiting for the current one to finish fading out.
-     *
+     * <p>
      * Driven by the fade COMPLETING rather than a timer, so the new song can
      * never begin while the old session is still winding down — a timer would
      * race the finish hop to the main thread and the winner would cut the
@@ -298,35 +296,28 @@ public class PlaybackManager implements Listener {
     public void loadHotSettings() {
         var config = plugin.getConfig();
         this.showActionBar = config.getBoolean("playback.show-actionbar", true);
-        this.barLength = Math.max(4, Math.min(40,
-                config.getInt("playback.actionbar-length", 20)));
+        this.barLength = Math.clamp(config.getInt("playback.actionbar-length", 20), 4, 40);
         this.respectLoop = config.getBoolean("playback.respect-loop", true);
-        this.fadeOutMs = Math.max(0, Math.min(5000,
-                config.getInt("playback.fade-out-ms", 500)));
+        this.fadeOutMs = Math.clamp(config.getInt("playback.fade-out-ms", 500), 0, 5000);
         this.voiceAllocation = config.getBoolean("playback.voice-allocation", true);
         // Upper bound is the CONFIGURED pool, not a hardcoded vanilla 247:
         // client mods can enlarge the audio engine's source pool, and an
         // admin who raised client-channels to match must be able to raise the
         // ceiling with it.
         int channels = PolyphonyAnalyzer.clientChannels(plugin);
-        this.voiceCeiling = Math.max(16, Math.min(channels,
-                config.getInt("playback.voice-ceiling", 200)));
+        // clientChannels() is never below 16, so the bounds cannot cross.
+        this.voiceCeiling = Math.clamp(config.getInt("playback.voice-ceiling", 200), 16, channels);
         this.humanize = config.getBoolean("playback.humanize", true);
-        this.humanizeTimingMs = Math.max(0, Math.min(50,
-                config.getDouble("playback.humanize-timing-ms", 6)));
-        this.humanizeVelocity = Math.max(0, Math.min(0.5,
-                config.getDouble("playback.humanize-velocity", 0.04)));
-        this.humanizePercussion = Math.max(0, Math.min(1,
-                config.getDouble("playback.humanize-percussion-factor", 0.25)));
-        this.humanizeDrift = Math.max(0, Math.min(1,
-                config.getDouble("playback.humanize-drift", 0.7)));
+        this.humanizeTimingMs = Math.clamp(config.getDouble("playback.humanize-timing-ms", 6), 0d, 50d);
+        this.humanizeVelocity = Math.clamp(config.getDouble("playback.humanize-velocity", 0.04), 0d, 0.5);
+        this.humanizePercussion = Math.clamp(config.getDouble("playback.humanize-percussion-factor", 0.25), 0d, 1d);
+        this.humanizeDrift = Math.clamp(config.getDouble("playback.humanize-drift", 0.7), 0d, 1d);
 
         this.followPlayer = config.getBoolean("playback.follow-player", true);
         // Panning needs a world position to offset; attached sounds have none
         this.stereoPanning = !this.followPlayer
                 && config.getBoolean("playback.stereo-panning", true);
-        this.panDistance = Math.max(0.1, Math.min(8.0,
-                config.getDouble("playback.pan-distance", 2.0)));
+        this.panDistance = Math.clamp(config.getDouble("playback.pan-distance", 2.0), 0.1, 8.0);
         this.softLimiter = config.getBoolean("playback.soft-limiter", true);
         this.limiterThreshold = Math.max(2, config.getInt("playback.limiter-threshold", 8));
         this.audibleFloor = configuredAudibleFloor(plugin);
@@ -334,8 +325,7 @@ public class PlaybackManager implements Listener {
         boolean wasHighPrecision = this.highPrecision;
         int wasPrecisionMs = this.precisionMs;
         this.highPrecision = config.getBoolean("playback.high-precision", true);
-        this.precisionMs = Math.max(2, Math.min(25,
-                config.getInt("playback.precision-ms", 2)));
+        this.precisionMs = Math.clamp(config.getInt("playback.precision-ms", 2), 2, 25);
 
         // Only churn the clock thread if the timing settings actually changed
         if (this.highPrecision != wasHighPrecision || this.precisionMs != wasPrecisionMs) {
@@ -413,7 +403,7 @@ public class PlaybackManager implements Listener {
 
     /**
      * Gain for a tick carrying {@code count} simultaneous notes.
-     *
+     * <p>
      * The client mixes sounds by summing them, so a dense chord at full
      * velocity sums past 1.0 and clips — that's the harsh "mush" on busy
      * passages. Below the threshold nothing changes (quiet passages keep
@@ -429,14 +419,14 @@ public class PlaybackManager implements Listener {
 
     /**
      * Volume to SEND so an entity-attached note ARRIVES at the intended gain.
-     *
+     * <p>
      * An attached sound is positioned at the entity's feet, while the game's
      * listener sits at the camera — about 1.62 blocks higher. Minecraft's
      * audible radius is max(volume, 1) x 16 blocks and attenuation is linear,
      * so that fixed gap costs a constant fraction of the gain:
-     *
-     *     gain = volume x (1 - distance / 16)        (for volume <= 1)
-     *
+     * <p>
+     *     gain = volume x (1 - distance / 16)        (for volume &lt;= 1)
+     * <p>
      * i.e. every attached note arrives ~10% quiet. Divide it back out. Past
      * ~0.9 that needs a volume above 1.0, which in Minecraft does NOT play
      * louder — it only widens the radius, which is exactly the lever we want.
@@ -488,7 +478,7 @@ public class PlaybackManager implements Listener {
     }
     private void startRequested(Player player, NbsSong song, String publicId, PlayRequest request) {
         if (!isCurrent(request)) return;
-        if (publicId != null) pendingSelections.computeIfAbsent(selectionKey(request), key -> new PendingSelection(request, publicId));
+        if (publicId != null) pendingSelections.computeIfAbsent(selectionKey(request), _ -> new PendingSelection(request, publicId));
         UUID id = player.getUniqueId();
         Playback current = sessions.get(id);
 
@@ -506,11 +496,6 @@ public class PlaybackManager implements Listener {
         startWhenPackSettles(player, song, publicId, request);
     }
 
-    /** True when a song is playing and already ramping down. */
-    public boolean isFadingOut(UUID playerId) {
-        Playback playback = sessions.get(playerId);
-        return playback != null && playback.isFading();
-    }
 
     private void startWhenPackSettles(Player player, NbsSong song, String publicId, PlayRequest request) {
         if (!readyToStart(player, publicId, request)) return;
@@ -569,14 +554,14 @@ public class PlaybackManager implements Listener {
 
     /**
      * The name to show for a song.
-     *
+     * <p>
      * Prefers the title recorded in the library over the one inside the .nbs.
      * A file imported with no internal title still gets a real name at import
      * time -- from the name given to /nbw importurl, or the file name -- and
      * that is what the browser and /nbw playing display. Reading the NBS
      * header here instead meant the same song appeared under its proper name
      * everywhere except while it was playing, where it said "Untitled".
-     *
+     * <p>
      * Falls back to the header, then to the placeholder, so a song that has
      * neither still shows something.
      */
@@ -627,18 +612,10 @@ public class PlaybackManager implements Listener {
         }
     }
 
-    /** Starts a broadcast of an unidentified song (no custom sounds). */
-    public void startBroadcast(Player starter, NbsSong song) {
-        startBroadcast(starter, song, null);
-    }
-
     /** Fades the outgoing broadcast, then starts the latest requested replacement. */
-    public void startBroadcast(Player starter, NbsSong song, String publicId) {
-        startBroadcastRequested(starter, song, publicId, beginPlay(starter, null, true));
-    }
     private void startBroadcastRequested(Player starter, NbsSong song, String publicId, PlayRequest request) {
         if (!isCurrent(request)) return;
-        if (publicId != null) pendingSelections.computeIfAbsent(selectionKey(request), key -> new PendingSelection(request, publicId));
+        if (publicId != null) pendingSelections.computeIfAbsent(selectionKey(request), _ -> new PendingSelection(request, publicId));
         Playback current = broadcastSession;
         if (current != null && (current.isFading() || current.beginFade())) {
             cancelPendingBroadcast();
@@ -721,7 +698,7 @@ public class PlaybackManager implements Listener {
 
     /**
      * Stops a player's song at once, with no ramp.
-     *
+     * <p>
      * This is the form shutdown and quit must use: a fading session stays
      * registered and keeps stepping, so fading here would leave onDisable
      * killing the clock before anything was cancelled -- notes would hang on
@@ -777,7 +754,7 @@ public class PlaybackManager implements Listener {
 
     /**
      * Stops a player's song, ramping down first when fade-out-ms allows.
-     *
+     * <p>
      * The session stays registered while it fades so it keeps stepping; it
      * removes itself when the ramp completes. A second call finds the fade
      * already running and cuts immediately, so repeating the command always
@@ -939,7 +916,7 @@ public class PlaybackManager implements Listener {
             stop(id);
         }
         stopBroadcast();
-        for (UUID id : listenerVoices.keySet()) cutVoices(id, voice -> true);
+        for (UUID id : listenerVoices.keySet()) cutVoices(id, _ -> true);
         listenerVoices.clear();
         shutdownClock();
     }
@@ -1060,7 +1037,7 @@ public class PlaybackManager implements Listener {
 
     /**
      * A chord, or its melodic/percussion group, scheduled slightly off its exact tick.
-     *
+     * <p>
      * The limiter gain is captured HERE, at schedule time, from the size of
      * the whole chord, preserving its balance when percussion and melody
      * use different timing offsets. Equal deadlines keep insertion order.
@@ -1072,11 +1049,11 @@ public class PlaybackManager implements Listener {
      * One listener's state, captured on the MAIN thread once per game tick.
      * The clock thread reads only this — never the live world — so nothing
      * touches Bukkit off-thread.
-     *
+     * <p>
      * forward/right are null unless stereo panning applies; velocity is in
      * blocks per second and leadSeconds is the listener's round-trip time.
      */
-    private record Listener(Player player, UUID id, org.bukkit.Location ear,
+    private record ListenerSnapshot(Player player, UUID id, org.bukkit.Location ear,
                             double[] forward, double[] right, double[] velocity, long sampledNanos, double leadSeconds,
                             float volume, Map<String, Double> eventSeconds,
                             double eyeHeight, Voices voices) {}
@@ -1097,7 +1074,7 @@ public class PlaybackManager implements Listener {
         private final String[][] customSoundEvents;
 
         /** Refreshed on the main thread each tick; read by the clock thread. */
-        private volatile List<Listener> listeners = List.of();
+        private volatile List<ListenerSnapshot> listeners = List.of();
         /** Main-thread warning fingerprints; unchanged problems are reported only once. */
         private final Map<UUID, String> customWarnings = new java.util.HashMap<>();
         private volatile boolean started = false;
@@ -1105,6 +1082,16 @@ public class PlaybackManager implements Listener {
         private volatile boolean finishing = false;
         /** Read by the action bar (main thread), written by the stepping thread. */
         private volatile double elapsedSeconds = 0;
+
+        /**
+         * Only the stepping thread writes elapsedSeconds (the main thread just
+         * reads it for the action bar), so this read-then-write cannot lose
+         * an update.
+         */
+        @SuppressWarnings("NonAtomicOperationOnVolatileField")
+        private void advanceClock(double seconds) {
+            elapsedSeconds += seconds;
+        }
 
         /** Timing state, only ever touched by the stepping thread. */
         private double currentTempo;
@@ -1132,26 +1119,26 @@ public class PlaybackManager implements Listener {
 
         /**
          * Where a world-placed note should sound for this listener.
-         *
+         * <p>
          * Two corrections over placing it at the last snapshot:
-         *
+         * <p>
          * 1. Panning is by DIRECTION. The note sits at the angle whose sine
          *    is the pan, pan-distance from the camera. Previously it was put
          *    straight to the side at pan x pan-distance, and a sound directly
          *    to the side pans fully however close it is, so every panned note
          *    came out hard left or hard right.
-         *
+         * <p>
          * 2. The listener keeps moving. The snapshot is up to a tick old, and
          *    the client receives the packet about one round trip after the
          *    position the server last heard from it. The note is led along
          *    the listener's velocity by that time, so it starts where they
          *    actually are rather than behind them -- the gap that made notes
          *    lurch sideways and fade while sprinting or flying.
-         *
+         * <p>
          * A note still stays where it started once it plays: Minecraft cannot
          * move a playing sound. follow-player avoids that drift entirely.
          */
-        private org.bukkit.Location panLocation(Listener listener, float pan, long now) {
+        private org.bukkit.Location panLocation(ListenerSnapshot listener, float pan, long now) {
             org.bukkit.Location ear = listener.ear();
             double[] velocity = listener.velocity();
             double ahead = Math.min(MAX_LEAD_SECONDS,
@@ -1264,14 +1251,14 @@ public class PlaybackManager implements Listener {
         private void refreshListeners() {
             ResourcePackService pack = plugin.getResourcePackService();
             boolean packActive = pack.isActive();
-            List<Listener> snapshot = new ArrayList<>();
+            List<ListenerSnapshot> snapshot = new ArrayList<>();
             Map<UUID, EarSample> ears = new java.util.HashMap<>();
             long sampled = System.nanoTime();
 
             for (Player player : audience(pack, packActive)) {
                 float volume = plugin.getVolumeManager().getFactor(player.getUniqueId());
                 if (volume <= 0f) continue;              // muted: emit nothing
-                warnUnavailableCustomAudio(player, pack, packActive);
+                warnUnavailableCustomAudio(player, pack);
                 org.bukkit.Location ear = player.getEyeLocation();
                 double[] forward = stereoPanning ? PanGeometry.forward(ear.getYaw(), ear.getPitch()) : null;
                 double[] right = stereoPanning ? PanGeometry.right(ear.getYaw()) : null;
@@ -1289,15 +1276,15 @@ public class PlaybackManager implements Listener {
                         if (seconds > 0 && seconds < 1 && dx * dx + dy * dy + dz * dz < TELEPORT_BLOCKS * TELEPORT_BLOCKS)
                             velocity = new double[]{dx / seconds, dy / seconds, dz / seconds};
                     }
-                    leadSeconds = Math.max(0, Math.min(1000, player.getPing())) / 1000.0;
+                    leadSeconds = Math.clamp(player.getPing(), 0, 1000) / 1000.0;
                 }
                 // Voice accounting is created here, on the main thread, for
                 // online listeners only. The clock thread uses this reference;
                 // creating it there re-registered players who had just quit
                 // while a stale snapshot was still being played, and nothing
                 // ever removed those entries again.
-                Voices voices = listenerVoices.computeIfAbsent(player.getUniqueId(), unused -> new Voices());
-                snapshot.add(new Listener(player, player.getUniqueId(), ear, forward, right, velocity, sampled, leadSeconds,
+                Voices voices = listenerVoices.computeIfAbsent(player.getUniqueId(), _ -> new Voices());
+                snapshot.add(new ListenerSnapshot(player, player.getUniqueId(), ear, forward, right, velocity, sampled, leadSeconds,
                         volume, pack.eventDurations(player.getUniqueId()), player.getEyeHeight(), voices));
             }
             this.lastEars = ears;
@@ -1305,7 +1292,7 @@ public class PlaybackManager implements Listener {
         }
 
         /** Checks actual pack availability after the listener's loading/settling wait. */
-        private void warnUnavailableCustomAudio(Player player, ResourcePackService pack, boolean packActive) {
+        private void warnUnavailableCustomAudio(Player player, ResourcePackService pack) {
             if (song.getCustomNoteCount() == 0) return;
             UUID id = player.getUniqueId();
             boolean loaded = pack.isPackLoaded(id);
@@ -1393,8 +1380,8 @@ public class PlaybackManager implements Listener {
             if (delta <= 0) return;
             delta = Math.min(delta, 0.25);
 
-            elapsedSeconds += delta;
-            List<Listener> snapshot = listeners;
+            advanceClock(delta);
+            List<ListenerSnapshot> snapshot = listeners;
             double end = song.getDurationSeconds();
             while (!cancelled) {
                 position = song.positionAtSeconds(elapsedSeconds);
@@ -1411,7 +1398,7 @@ public class PlaybackManager implements Listener {
                 if (elapsedSeconds + 1e-10 < end) break;
                 if (shouldLoop()) {
                     double carry = Math.max(0, elapsedSeconds - end);
-                    restartLoop(); elapsedSeconds += carry;
+                    restartLoop(); advanceClock(carry);
                 } else {
                     if (pending.isEmpty()) requestFinish();
                     break;
@@ -1421,12 +1408,12 @@ public class PlaybackManager implements Listener {
 
         /**
          * Scatters a tick's notes in time.
-         *
+         * <p>
          * The tick's TRUE moment is reconstructed from how far past it the
          * clock has drifted, so jitter is measured from where the note should
          * have landed rather than from the step boundary — otherwise the clock
          * grid would just be traded for a coarser one.
-         *
+         * <p>
          * Drift is bounded to twice the spread. A positive spread is added,
          * and negative delays are clamped to zero: melodic delays can reach
          * three times the spread.
@@ -1466,7 +1453,7 @@ public class PlaybackManager implements Listener {
                 timingOffsetMs = humanizeDrift * wandered + (1 - humanizeDrift) * independent;
                 // Keep the wander from running away over a long song
                 double bound = spread * 2;
-                timingOffsetMs = Math.max(-bound, Math.min(bound, timingOffsetMs));
+                timingOffsetMs = Math.clamp(timingOffsetMs, -bound, bound);
             } else {
                 timingOffsetMs = 0;
             }
@@ -1485,7 +1472,7 @@ public class PlaybackManager implements Listener {
             }
         }
 
-        private void drainPending(long now, List<Listener> snapshot) {
+        private void drainPending(long now, List<ListenerSnapshot> snapshot) {
             while (!pending.isEmpty() && pending.peek().dueNanos() <= now) {
                 Scheduled due = pending.poll();
                 for (int position = due.from(); position < due.to(); position++) {
@@ -1498,7 +1485,7 @@ public class PlaybackManager implements Listener {
         }
 
         /** Reads a chord directly from compact storage, with no lists, note records or sorting. */
-        private void emitChord(int from, int to, List<Listener> snapshot) {
+        private void emitChord(int from, int to, List<ListenerSnapshot> snapshot) {
             if (from == to || snapshot.isEmpty()) return;
             float chordGain = limiterGain(to - from);
             boolean ordered = voiceAllocation;
@@ -1508,7 +1495,7 @@ public class PlaybackManager implements Listener {
         }
 
         /** Emits a single note to every listener. */
-        private void emitNote(int noteIndex, float chordGain, List<Listener> snapshot) {
+        private void emitNote(int noteIndex, float chordGain, List<ListenerSnapshot> snapshot) {
             // Sampled once per note so every listener hears the same point on
             // the ramp and a single note cannot straddle two fade values.
             float fade = fadeGain(System.nanoTime());
@@ -1523,8 +1510,7 @@ public class PlaybackManager implements Listener {
             int instrument = song.noteInstrument(noteIndex), octave = song.noteOctave(noteIndex);
             int custom = song.noteCustomIndex(noteIndex);
             float notePitch = song.notePitch(noteIndex), noteVolume = song.noteVolume(noteIndex), pan = song.notePan(noteIndex);
-            for (Listener listener : snapshot) {
-                UUID id = listener.id();
+            for (ListenerSnapshot listener : snapshot) {
                 String key = null;
                 double seconds = -1;
                 boolean shifted = false;
@@ -1584,7 +1570,7 @@ public class PlaybackManager implements Listener {
         private static float runtimePitch(float pitch, int octave, boolean shifted) {
             if (shifted || octave == 0) return pitch;
             double folded = Math.scalb((double) pitch, octave);
-            return (float) Math.max(0.5, Math.min(2.0, folded));
+            return (float) Math.clamp(folded, 0.5, 2.0);
         }
         private double vanillaSeconds(int instrument) {
             double[] current = vanillaRingCache;
@@ -1634,7 +1620,7 @@ public class PlaybackManager implements Listener {
         private void restartLoop() {
             loopsDone++;
             timingOffsetMs = 0;
-            int start = Math.max(0, Math.min(song.getLengthTicks(), song.getLoopStartTick()));
+            int start = Math.clamp(song.getLoopStartTick(), 0, Math.max(0, song.getLengthTicks()));
             position = start;
             nextChord = song.firstChordAfter(start - 1);
             elapsedSeconds = song.getSecondsUpTo(start);
@@ -1703,9 +1689,9 @@ public class PlaybackManager implements Listener {
 
             var messages = plugin.getMessages();
             Component bar = messages.get("playback.bar-filled",
-                            Placeholder.unparsed("chars", "\u25ac".repeat(filled)))
+                            Placeholder.unparsed("chars", "▬".repeat(filled)))
                     .append(messages.get("playback.bar-empty",
-                            Placeholder.unparsed("chars", "\u25ac".repeat(barLength - filled))));
+                            Placeholder.unparsed("chars", "▬".repeat(barLength - filled))));
 
             String title = displayTitle(song, publicId);
 
@@ -1715,7 +1701,7 @@ public class PlaybackManager implements Listener {
                     Placeholder.unparsed("total", formatTime(total)),
                     Placeholder.component("bar", bar));
 
-            for (Listener listener : listeners) {
+            for (ListenerSnapshot listener : listeners) {
                 listener.player().sendActionBar(actionBar);
             }
         }
@@ -1727,14 +1713,14 @@ public class PlaybackManager implements Listener {
 
         /**
          * Ends the session but leaves ringing notes to decay on their own.
-         *
+         * <p>
          * This is what makes a fade audible. Minecraft cannot alter a sound
          * that is already playing, so the ramp only quietens notes struck
          * DURING it -- everything struck in the second or so before still
          * rings at full volume. Calling stopSound at the end therefore
          * guillotined exactly the loudest part, which is why the fade was
          * barely perceptible: it was a delayed hard cut.
-         *
+         * <p>
          * The same applies at a song's natural end, where cutting truncated
          * the final chord instead of letting it ring.
          */
@@ -1761,7 +1747,7 @@ public class PlaybackManager implements Listener {
                 }
             }
             // Natural endings and completed fades leave sounds ringing.
-            for (Listener listener : listeners) {
+            for (ListenerSnapshot listener : listeners) {
                 if (showActionBar && (isBroadcast() ? broadcastSession == null || broadcastSession == this
                         : sessions.get(owner.getUniqueId()) == null || sessions.get(owner.getUniqueId()) == this)) {
                     listener.player().sendActionBar(Component.empty());

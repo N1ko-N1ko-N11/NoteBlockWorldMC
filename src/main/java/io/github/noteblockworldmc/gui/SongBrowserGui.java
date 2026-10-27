@@ -40,14 +40,14 @@ import java.util.HashMap;
 
 /**
  * Chest GUI browser for the Note Block World catalog.
- *
+ * <p>
  * Layout (6 rows / 54 slots):
  *   0-35   songs (4 rows, 36 per page = one API request per GUI page)
  *   36-44  divider
  *   45     prev page       46 page info      47 next page (or reroll for random)
  *   48     search          49 sort selector  50 order toggle
  *   51     category        52 filler         53 stop
- *
+ * <p>
  * The GUI owns a SongQuery; every control click derives a new query
  * (via toBuilder/withPage) and refetches. All Bukkit interaction happens
  * on the main thread; only the HTTP call is async.
@@ -144,7 +144,7 @@ public class SongBrowserGui implements InventoryHolder {
 
     /**
      * Opens the search dialog on its own, with no browser behind it.
-     *
+     * <p>
      * For bare {@code /nbw search}: the player gets the input box straight
      * away rather than a usage line telling them what to type. Constructing
      * the GUI is inert -- it only builds an inventory object; nothing is shown
@@ -174,13 +174,13 @@ public class SongBrowserGui implements InventoryHolder {
 
     /**
      * Short click for a press that did something.
-     *
+     * <p>
      * Deliberately NOT in SoundCategory.RECORDS. That is the category note
      * playback uses and the one stopSound clears, so a UI blip there would be
      * silenced by a hard stop in that category. MASTER keeps the click outside
      * the music category; it is also sent without personal-volume scaling.
      * All categories still share the client's sound-channel pool.
-     *
+     * <p>
      * Read from config on each click rather than cached, so toggling it takes
      * effect immediately with no reload wiring.
      */
@@ -192,7 +192,7 @@ public class SongBrowserGui implements InventoryHolder {
     /**
      * True if this click came too soon after the last one that could hit the
      * API, in which case the caller should drop it.
-     *
+     * <p>
      * Shared by the control row and the retry barrier so there is one rate
      * limit rather than one per call site.
      */
@@ -340,7 +340,7 @@ public class SongBrowserGui implements InventoryHolder {
     private static int descriptionPageCount(SongPreview song) {
         String desc = song.getDescription();
         if (desc == null || desc.isBlank()) return 1;
-        int lines = wrap(desc, DESC_WRAP_WIDTH).size();
+        int lines = wrap(desc).size();
         return Math.max(1, (lines + DESC_LINES_PER_PAGE - 1) / DESC_LINES_PER_PAGE);
     }
 
@@ -399,7 +399,7 @@ public class SongBrowserGui implements InventoryHolder {
                 : msg("download.downloading", Placeholder.unparsed("song", song.getTitle())));
 
         var playRequest = plugin.getPlaybackManager().beginPlay(player, player, broadcast);
-        downloads.download(id, song).whenComplete((path, throwable) ->
+        downloads.download(id, song).whenComplete((_, throwable) ->
                 plugin.runMain(() -> {
                     if (throwable != null) {
                         plugin.getPlaybackManager().abandon(playRequest);
@@ -513,7 +513,7 @@ public class SongBrowserGui implements InventoryHolder {
 
     /**
      * Requests the current page, coalescing bursts into at most one extra call.
-     *
+     * <p>
      * The requestId below only discards a stale RESPONSE -- every click still
      * sent a real request, so holding the next-page button fired one API call
      * per click and threw all but the last away. Against a small volunteer-run
@@ -723,7 +723,7 @@ public class SongBrowserGui implements InventoryHolder {
         String desc = song.getDescription();
         boolean paginated = false;
         if (desc != null && !desc.isBlank()) {
-            List<String> lines = wrap(desc, DESC_WRAP_WIDTH);
+            List<String> lines = wrap(desc);
             int totalPages = Math.max(1,
                     (lines.size() + DESC_LINES_PER_PAGE - 1) / DESC_LINES_PER_PAGE);
             paginated = totalPages > 1;
@@ -771,7 +771,7 @@ public class SongBrowserGui implements InventoryHolder {
      * Word-wraps text to the given width, preserving the author's paragraph
      * breaks and hard-breaking words longer than a whole line.
      */
-    private static List<String> wrap(String text, int width) {
+    private static List<String> wrap(String text) {
         List<String> lines = new ArrayList<>();
         for (String paragraph : text.split("\n", -1)) {
             StringBuilder line = new StringBuilder();
@@ -780,18 +780,18 @@ public class SongBrowserGui implements InventoryHolder {
                 if (word.isEmpty()) continue;
 
                 // Hard-break words longer than a whole line (URLs, etc.)
-                while (word.length() > width) {
-                    if (line.length() > 0) {
+                while (word.length() > DESC_WRAP_WIDTH) {
+                    if (!line.isEmpty()) {
                         lines.add(line.toString());
                         line.setLength(0);
                     }
-                    lines.add(word.substring(0, width));
-                    word = word.substring(width);
+                    lines.add(word.substring(0, DESC_WRAP_WIDTH));
+                    word = word.substring(DESC_WRAP_WIDTH);
                 }
 
-                if (line.length() == 0) {
+                if (line.isEmpty()) {
                     line.append(word);
-                } else if (line.length() + 1 + word.length() <= width) {
+                } else if (line.length() + 1 + word.length() <= DESC_WRAP_WIDTH) {
                     line.append(' ').append(word);
                 } else {
                     lines.add(line.toString());
@@ -802,8 +802,8 @@ public class SongBrowserGui implements InventoryHolder {
             lines.add(line.toString()); // keeps intentional blank lines
         }
         // Drop trailing blank lines
-        while (!lines.isEmpty() && lines.get(lines.size() - 1).isBlank()) {
-            lines.remove(lines.size() - 1);
+        while (!lines.isEmpty() && lines.getLast().isBlank()) {
+            lines.removeLast();
         }
         return lines;
     }
@@ -899,7 +899,7 @@ public class SongBrowserGui implements InventoryHolder {
 
     /**
      * Opens the search dialog prefilled with {@code prefill}.
-     *
+     * <p>
      * Buttons: Search (submits), Clear (opens a fresh browser with default
      * filters -- the same view as bare /nbw, since a dialog button can't blank
      * an input in place), and Cancel.
@@ -925,7 +925,7 @@ public class SongBrowserGui implements InventoryHolder {
                                                 DIALOG_CALLBACK))
                                         .build(),
                                 ActionButton.builder(msg("dialog.button-clear"))
-                                        .action(DialogAction.customClick((response, audience) ->
+                                        .action(DialogAction.customClick((_, audience) ->
                                                 plugin.runMain(() -> {
                                                     if (audience == player && player.isOnline() && player.hasPermission("noteblockworldmc.browse")) {
                                                         new SongBrowserGui(plugin, player,

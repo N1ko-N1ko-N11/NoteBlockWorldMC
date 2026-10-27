@@ -8,14 +8,14 @@ import java.util.Map;
 
 /**
  * Works out how many client sound channels a song actually demands.
- *
+ * <p>
  * The client has a fixed pool of roughly 250 channels for the WHOLE game
  * (footsteps, mobs, ambience — everything), and a sound holds its channel for
  * its entire sample, not just its onset. So the thing that starves a song is
  * not notes-per-tick but overlap:
- *
+ * <p>
  *     concurrent voices = notes still ringing at the same instant
- *
+ * <p>
  * Rather than guess how long a harp rings, every sample's true length is read
  * from its Ogg granule position. Rate-shifted octave variants are shorter or
  * longer by exactly their shift, which this accounts for — a note three
@@ -70,17 +70,14 @@ public final class PolyphonyAnalyzer {
 
     /** The configured client pool size, defaulting to the vanilla figure. */
     public static int clientChannels(NoteblockWorldMCPlugin plugin) {
-        return Math.max(16, Math.min(8192, plugin.getConfig()
-                .getInt("playback.client-channels", DEFAULT_CLIENT_CHANNELS)));
+        return Math.clamp(plugin.getConfig()
+                .getInt("playback.client-channels", DEFAULT_CLIENT_CHANNELS), 16, 8192);
     }
 
     private PolyphonyAnalyzer() {
     }
 
     /** One pass of arrangement demand before voice trimming, fades and humanization. */
-    public static Report analyze(NoteblockWorldMCPlugin plugin, NbsSong song, String publicId) {
-        return analyze(plugin, song, publicId, null);
-    }
     public static Report analyze(NoteblockWorldMCPlugin plugin, NbsSong song, String publicId, java.util.UUID listener) {
         var pack = plugin.getResourcePackService();
         Map<String, Double> manifest = pack.eventDurations(listener);
@@ -151,7 +148,7 @@ public final class PolyphonyAnalyzer {
     private static float runtimePitch(float pitch, int octave, boolean shifted) {
         if (shifted || octave == 0) return pitch;
         double folded = Math.scalb((double) pitch, octave);
-        return (float) Math.max(0.5, Math.min(2.0, folded));
+        return (float) Math.clamp(folded, 0.5, 2.0);
     }
 
     /** Peak overlap via a sorted start/end sweep. */
@@ -202,7 +199,6 @@ public final class PolyphonyAnalyzer {
             }
         }
 
-        double duration = songSeconds;
         // Convert accumulated voice-seconds into an average voice count per slice
         double sliceSeconds = songSeconds / DENSITY_BUCKETS;
         for (int i = 0; i < density.length; i++) {
@@ -210,7 +206,7 @@ public final class PolyphonyAnalyzer {
         }
 
         return new Report(song.getName(), song.getDurationSeconds(), count,
-                song.getMergedNotes(), peak, peakAt, weighted / duration, estimated,
+                song.getMergedNotes(), peak, peakAt, weighted / songSeconds, estimated,
                 clientChannels, NbsSong.clampTempo(song.getTempo()),
                 minTempo, maxTempo, density, songSeconds, excluded, scope);
     }
@@ -225,13 +221,12 @@ public final class PolyphonyAnalyzer {
         if (active <= 0 || to <= from) return;
         int n = buckets.length;
         double width = songSeconds / n;
-        int first = Math.max(0, Math.min(n - 1, (int) (from / width)));
-        int last = Math.max(0, Math.min(n - 1, (int) (to / width)));
+        int first = Math.clamp((long) (from / width), 0, n - 1);
+        int last = Math.clamp((long) (to / width), 0, n - 1);
         for (int b = first; b <= last; b++) {
             double overlap = Math.min(to, (b + 1) * width) - Math.max(from, b * width);
             if (overlap > 0) buckets[b] += active * overlap;
         }
     }
 
-    /** Reads each custom instrument's sample length from the song's own files. */
 }

@@ -66,7 +66,7 @@ public final class NoteblockWorldMCPlugin extends JavaPlugin {
     }
 
     private volatile org.bukkit.configuration.file.FileConfiguration runtimeConfig;
-    @Override public org.bukkit.configuration.file.FileConfiguration getConfig() {
+    @Override @org.jspecify.annotations.NullMarked public org.bukkit.configuration.file.FileConfiguration getConfig() {
         var current = runtimeConfig; return current == null ? super.getConfig() : current;
     }
     private org.bukkit.configuration.file.FileConfiguration readSettings() {
@@ -134,9 +134,9 @@ public final class NoteblockWorldMCPlugin extends JavaPlugin {
     }
 
     /** Publishes a replacement before gracefully retiring the old HTTP client. */
-    private boolean reloadApiClient() {
+    private void reloadApiClient() {
         ApiSettings next = apiSettings(getConfig());
-        if (next.equals(apiSettings)) return false;
+        if (next.equals(apiSettings)) return;
         NoteBlockWorldClient replacement = new NoteBlockWorldClient(next.baseUrl(),
                 getPluginMeta().getVersion(), next.connectTimeout(), next.requestTimeout());
         NoteBlockWorldClient previous = apiClient;
@@ -145,7 +145,6 @@ public final class NoteblockWorldMCPlugin extends JavaPlugin {
         replacement.refreshCategories();
         // Retirement cancels outstanding requests without blocking the server thread.
         if (previous != null) previous.shutdown();
-        return true;
     }
 
     @Override

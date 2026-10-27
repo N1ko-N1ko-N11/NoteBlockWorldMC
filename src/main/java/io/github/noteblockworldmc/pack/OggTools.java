@@ -3,18 +3,18 @@ package io.github.noteblockworldmc.pack;
 /**
  * Minimal Ogg Vorbis surgery: shifts a sound's pitch by rewriting the
  * sample rate in its Vorbis identification header.
- *
+ * <p>
  * WHY: Minecraft clamps the FINAL sound pitch to [0.5, 2.0] client-side
  * (SoundEngine), and a resource pack's "pitch" field multiplies into that
  * same value before the clamp — so pitch multipliers in sounds.json can
  * never break out of the vanilla two-octave window. The only way to place
  * a note outside it is to ship audio that plays at a different rate.
- *
+ * <p>
  * Re-encoding needs a Vorbis codec; instead we simply tell the decoder the
  * audio was sampled at rate x 2^k. It then plays it 2^k times faster
  * (or slower) — an exact octave shift, no decoding, no quality loss beyond
  * the resampling the client already does.
- *
+ * <p>
  * Only the first Ogg page is touched (it carries the identification
  * header), so only that page's CRC needs recomputing.
  */
@@ -22,7 +22,7 @@ public final class OggTools {
 
     /**
      * Rate bounds for shifted copies.
-     *
+     * <p>
      * +3 octaves multiplies the source rate by 8, so a 44.1/48 kHz sample
      * lands at 352.8/384 kHz. That is above the Vorbis spec's nominal
      * 200 kHz ceiling, but the decoder stores the rate as a plain integer
@@ -50,7 +50,7 @@ public final class OggTools {
 
     /**
      * Whether the buffer starts with the Ogg capture pattern.
-     *
+     * <p>
      * Length check is {@code >= 4}, not {@code > 4}: the magic IS four bytes,
      * so a caller that reads exactly the magic (to test a file cheaply
      * without loading it) must not be told a valid stream is invalid.
@@ -104,8 +104,7 @@ public final class OggTools {
         if (seconds <= 0 || seconds > io.github.noteblockworldmc.util.Limits.SAMPLE_SECONDS) return null;
         byte[] copy = source.bytes().clone();
         writeIntLE(copy, offset + 12, shiftedRate);
-        if (!fixPageCrc(copy, 0)) return null;
-        return new Sample(copy, seconds);
+        return fixFirstPageCrc(copy) ? new Sample(copy, seconds) : null;
     }
 
     public static double readDurationSeconds(byte[] data) {
@@ -133,7 +132,8 @@ public final class OggTools {
             if (ended || offset + 27 > data.length || data[offset] != 'O' || data[offset+1] != 'g'
                     || data[offset+2] != 'g' || data[offset+3] != 'S' || data[offset+4] != 0) return -1;
             int flags = data[offset+5] & 255, segments = data[offset+26] & 255;
-            if ((flags & ~7) != 0 || ((flags & 1) != 0) != continued || ((flags & 2) != 0) != (sequence == 0)) return -1;
+            boolean continuesPacket = (flags & 1) != 0, firstPage = (flags & 2) != 0;
+            if ((flags & ~7) != 0 || continuesPacket != continued || firstPage != (sequence == 0)) return -1;
             if (offset + 27 + segments > data.length || readIntLE(data, offset+18) != sequence++) return -1;
             int stream = readIntLE(data, offset+14);
             if (offset == 0) serial = stream; else if (stream != serial) return -1;
@@ -169,6 +169,7 @@ public final class OggTools {
                             if (modes == null) return -1;
                         }
                     } else {
+                        if (modes == null) return -1;   // set by the setup header (packet 2) above
                         int width = VorbisSetup.ilog(modes.length - 1);
                         int mode = (audioPrefix >>> 1) & ((1 << width) - 1);
                         if (audioPrefixBytes == 0 || (audioPrefix & 1) != 0 || mode >= modes.length
@@ -216,33 +217,6 @@ public final class OggTools {
         return readIntLE(ogg, offset + 12);
     }
 
-    /**
-     * Returns a copy of the sound shifted by {@code octaves}, or null if
-     * the shift would put the sample rate outside the decodable range
-     * (callers then fall back to folding the note into the base window).
-     */
-    public static byte[] shiftOctaves(byte[] ogg, int octaves) {
-        if (ogg == null || !isVorbis(ogg)) return null;
-        if (octaves == 0) return ogg;
-
-        // Locate the header ONCE and reuse it. Recomputing it after the clone
-        // meant a second scan, and its -1 failure value went unchecked — a
-        // future change that made the two disagree would write the rate at
-        // offset 11, corrupting the page header instead of failing.
-        int offset = identificationHeaderOffset(ogg);
-        if (offset < 0) return null;
-        int rate = readIntLE(ogg, offset + 12);
-        if (rate <= 0) return null;
-
-        double shifted = rate * Math.pow(2, octaves);
-        if (shifted < MIN_RATE || shifted > MAX_RATE) return null;
-
-        byte[] copy = ogg.clone();
-        writeIntLE(copy, offset + 12, (int) Math.round(shifted));
-        if (!fixPageCrc(copy, 0) || readDurationSeconds(copy) <= 0) return null;   // malformed page
-        return copy;
-    }
-
     // ------------------------------------------------------------------
 
     /** Offset of the Vorbis identification packet inside the first page. */
@@ -262,33 +236,33 @@ public final class OggTools {
     }
 
     /**
-     * Recomputes the CRC of the page starting at pageStart.
+     * Recomputes the CRC of the first page.
      * Returns false if the page header is malformed — these files come from
      * arbitrary uploaders, so a bogus segment table must not walk off the
      * end of the array and take the whole pack rebuild down with it.
      */
-    private static boolean fixPageCrc(byte[] ogg, int pageStart) {
-        if (pageStart + 27 > ogg.length) return false;
-        int segmentCount = ogg[pageStart + 26] & 0xFF;
+    private static boolean fixFirstPageCrc(byte[] ogg) {
+        if (ogg.length < 27) return false;
+        int segmentCount = ogg[26] & 0xFF;
         int headerLength = 27 + segmentCount;
-        if (pageStart + headerLength > ogg.length) return false;
+        if (headerLength > ogg.length) return false;
 
         int payload = 0;
         for (int i = 0; i < segmentCount; i++) {
-            payload += ogg[pageStart + 27 + i] & 0xFF;
+            payload += ogg[27 + i] & 0xFF;
         }
         int pageLength = headerLength + payload;
-        if (pageStart + pageLength > ogg.length) return false;
+        if (pageLength > ogg.length) return false;
 
         // The CRC field itself is treated as zero while computing
         for (int i = 22; i < 26; i++) {
-            ogg[pageStart + i] = 0;
+            ogg[i] = 0;
         }
         int crc = 0;
         for (int i = 0; i < pageLength; i++) {
-            crc = (crc << 8) ^ CRC_TABLE[((crc >>> 24) ^ (ogg[pageStart + i] & 0xFF)) & 0xFF];
+            crc = (crc << 8) ^ CRC_TABLE[((crc >>> 24) ^ (ogg[i] & 0xFF)) & 0xFF];
         }
-        writeIntLE(ogg, pageStart + 22, crc);
+        writeIntLE(ogg, 22, crc);
         return true;
     }
 

@@ -28,12 +28,12 @@ import java.util.Map;
  * Obtains the vanilla note block sounds so the pack can ship
  * octave-shifted copies of them (see {@link OggTools} for why shifted
  * COPIES are required rather than pitch multipliers).
- *
+ * <p>
  * The audio is pulled from Mojang's own asset CDN — the same source the
  * game itself downloads from, and the same approach noteblock.world uses
  * when packing custom instruments. Files are cached in
  * plugins/NoteblockWorldMC/vanilla-sounds/ and only fetched once.
- *
+ * <p>
  * A server owner who prefers not to fetch anything can simply drop the
  * .ogg files into that folder by hand (or disable the feature); anything
  * already present is never re-downloaded.
@@ -134,7 +134,7 @@ public class VanillaSounds {
 
     /**
      * Picks the asset file each instrument's note block event really plays.
-     *
+     * <p>
      * The event's first sound in sounds.json is authoritative; the alias table
      * covers a missing or unreadable sounds.json, and a stem search under any
      * "note" directory covers a future move of the files. Pure, so the choice
@@ -226,7 +226,7 @@ public class VanillaSounds {
 
     /**
      * Cached sound file for an instrument, or null if unavailable.
-     *
+     * <p>
      * Checks the file really IS an Ogg, not merely that it exists: a
      * truncated or empty cache file (a crash or full disk mid-write) would
      * otherwise satisfy hasAll(), so the sound would never be re-fetched,
@@ -258,7 +258,7 @@ public class VanillaSounds {
 
     /**
      * Asset index for the running version, parsed once and kept.
-     *
+     * <p>
      * It is roughly a megabyte of JSON and identical for every lookup, so a
      * song with twenty custom instruments must not fetch it twenty times.
      */
@@ -271,7 +271,7 @@ public class VanillaSounds {
 
     /**
      * Finds a song's custom instrument sound in Minecraft's own assets.
-     *
+     * <p>
      * A .nbs file names its custom instruments but cannot contain them, so an
      * imported song arrives with the names and no audio. Note Block World
      * sidesteps this by only accepting sounds that already exist in Minecraft
@@ -279,7 +279,7 @@ public class VanillaSounds {
      * solves it locally by copying sounds out of a Java installation. This is
      * the server-side equivalent: if the declared path names a real Minecraft
      * sound, fetch that sound from Mojang's CDN.
-     *
+     * <p>
      * Nothing here guesses. Candidate asset keys are looked up in Mojang's
      * index, which is authoritative -- a hit means the sound genuinely exists
      * in the game, a miss means it does not and the caller should report it
@@ -405,7 +405,7 @@ public class VanillaSounds {
         // sound files between versions, so the useful question is not "was it
         // found" but "what is it called now" -- and only the index that
         // shipped with this server can answer that.
-        List<String> near = nearestSounds(objects, stripKnownExtension(declaredPath), 6);
+        List<String> near = nearestSounds(objects, stripKnownExtension(declaredPath));
         if (!near.isEmpty()) {
             plugin.getLogger().warning("  Similar sounds in this version: " + near
                     + ". If one of these is the intended sound, set the custom"
@@ -424,17 +424,19 @@ public class VanillaSounds {
 
     /**
      * Sounds in the shipped index whose path resembles the requested name.
-     *
+     * <p>
      * Purely diagnostic: it never feeds recovery, because a loose resemblance
      * is exactly the kind of match that would hand a song the wrong
      * instrument. It exists so a failure names the real alternatives instead
      * of leaving an admin to guess what Minecraft calls the sound now.
-     *
+     * <p>
      * Scored on how many of the requested segments appear in the candidate
      * path, with the last segment (the file name) weighted highest, since
      * that is what survives Minecraft's directory reshuffles.
      */
-    private static List<String> nearestSounds(JsonObject objects, String name, int limit) {
+    private static final int NEAREST_SOUND_SUGGESTIONS = 6;
+
+    private static List<String> nearestSounds(JsonObject objects, String name) {
         if (name == null || name.isBlank()) return List.of();
         String[] segments = name.toLowerCase(java.util.Locale.ROOT)
                 .replace('.', '/').split("/");
@@ -461,9 +463,9 @@ public class VanillaSounds {
                 ? Integer.compare(b.score(), a.score())
                 : a.path().compareTo(b.path()));
 
-        List<String> out = new ArrayList<>(limit);
+        List<String> out = new ArrayList<>(NEAREST_SOUND_SUGGESTIONS);
         for (Scored hit : hits) {
-            if (out.size() >= limit) break;
+            if (out.size() >= NEAREST_SOUND_SUGGESTIONS) break;
             out.add(hit.path());
         }
         return out;
@@ -472,7 +474,7 @@ public class VanillaSounds {
     /**
      * Last-resort lookup: find a shipped sound whose path ends with the name
      * the song asked for.
-     *
+     * <p>
      * The name is tried from most to least specific -- "entity/firework/
      * blast_far.ogg", then "firework/blast_far.ogg", then "blast_far.ogg" --
      * and the first length that produces exactly ONE match wins. Requiring
@@ -490,7 +492,7 @@ public class VanillaSounds {
         for (int from = 0; from < segments.length; from++) {
             StringBuilder tail = new StringBuilder();
             for (int i = from; i < segments.length; i++) {
-                if (tail.length() > 0) tail.append('/');
+                if (!tail.isEmpty()) tail.append('/');
                 tail.append(segments[i]);
             }
             // Anchored on a separator so "blast_far.ogg" cannot match
@@ -517,7 +519,7 @@ public class VanillaSounds {
     /**
      * Resolves a Minecraft sound EVENT id to one of the real files it plays,
      * via the client's own sounds.json.
-     *
+     * <p>
      * An event can list several interchangeable files -- the game picks one
      * at random each time the event plays -- and can point to ANOTHER event
      * instead of a file at all. The first listed file is always chosen here
@@ -572,7 +574,7 @@ public class VanillaSounds {
 
     /**
      * Finds the modern name of a renamed sound event.
-     *
+     * <p>
      * Deliberately narrow. A candidate qualifies only when it has the same
      * number of dot-separated parts, its first and last parts match exactly,
      * and every requested part is a PREFIX of the corresponding part. That is
@@ -580,7 +582,7 @@ public class VanillaSounds {
      * qualifier ("firework" to "firework_rocket") while the surrounding
      * structure stayed put -- and it will not match two unrelated events that
      * merely share a word.
-     *
+     * <p>
      * A tie is rejected rather than broken: handing a song a plausible-but-
      * wrong instrument is worse than reporting that nothing was found.
      */
@@ -664,7 +666,7 @@ public class VanillaSounds {
     /**
      * A declared custom sound path reduced to one canonical spelling, with
      * separators and dot segments normalized.
-     *
+     * <p>
      * Exposed so the importer writes the recovered file under exactly the
      * path this class looked up. They used to normalise separately: a song
      * declaring "/dig/sand1.ogg" resolved fine here (leading slash stripped)
@@ -692,13 +694,13 @@ public class VanillaSounds {
 
     /**
      * Asset keys a declared path might correspond to.
-     *
-     * Minecraft's assets are keyed "minecraft/sounds/<path>.ogg". NBS records
+     * <p>
+     * Minecraft's assets are keyed {@code "minecraft/sounds/<path>.ogg"}. NBS records
      * whatever is under its own Sounds folder, and its "import sounds from
      * Minecraft" feature lays those out mirroring the game, so a declared
      * "minecraft/dig/sand1.ogg" and a declared "dig/sand1.ogg" should both
      * find "minecraft/sounds/dig/sand1.ogg".
-     *
+     * <p>
      * NBS also accepts .wav and .mp3, which Minecraft never ships, so the
      * extension is normalised to .ogg before looking up.
      */
@@ -791,7 +793,8 @@ public class VanillaSounds {
                 String previous = previousAsset(instrument, keys);
                 JsonObject previousEntry = previous == null || previous.equals(key) ? null : objects.getAsJsonObject(previous);
                 if (!replaceCached(have, hash, previousEntry == null ? null : previousEntry.get("hash").getAsString())) continue;
-                plugin.getLogger().info("Replacing cached " + instrument + ".ogg (" + previous.substring(previous.lastIndexOf('/') + 1)
+                String replacedName = previous == null ? "an unknown sample" : previous.substring(previous.lastIndexOf('/') + 1);
+                plugin.getLogger().info("Replacing cached " + instrument + ".ogg (" + replacedName
                         + ") with " + key.substring(key.lastIndexOf('/') + 1) + ", the sample Minecraft actually plays.");
                 replaced++;
             }

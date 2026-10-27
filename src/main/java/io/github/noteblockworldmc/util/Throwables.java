@@ -1,11 +1,8 @@
 package io.github.noteblockworldmc.util;
 
-import java.io.FileNotFoundException;
-import java.nio.file.NoSuchFileException;
-
 /**
  * Helpers for reporting the real reason a task failed.
- *
+ * <p>
  * Async work here is wrapped twice before it reaches a callback: a checked
  * IOException is rethrown as an UncheckedIOException so it can escape a lambda,
  * and CompletableFuture then wraps THAT in a CompletionException. Unwrapping a
@@ -20,7 +17,7 @@ public final class Throwables {
 
     /**
      * Walks to the deepest cause.
-     *
+     * <p>
      * Guards against a self-referencing cause and caps the depth, because a
      * malformed exception chain must not hang the thread reporting an error.
      */
@@ -35,15 +32,9 @@ public final class Throwables {
         return current;
     }
 
-    /** True when the failure was ultimately "that file is not there". */
-    public static boolean isMissingFile(Throwable throwable) {
-        Throwable root = rootCause(throwable);
-        return root instanceof NoSuchFileException || root instanceof FileNotFoundException;
-    }
-
     /**
      * A human-readable reason for display.
-     *
+     * <p>
      * Falls back to the exception's simple class name when the message is null
      * (common for NullPointerException and friends), so the player never sees
      * a bare "null".

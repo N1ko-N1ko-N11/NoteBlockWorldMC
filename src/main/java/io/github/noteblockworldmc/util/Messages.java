@@ -11,8 +11,6 @@ import java.io.File;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
-import java.util.ArrayList;
-import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -20,9 +18,9 @@ import java.util.concurrent.ConcurrentHashMap;
 /**
  * Loads user-facing text from messages.yml so every chat message, GUI
  * label, and dialog string can be translated or restyled.
- *
+ * <p>
  * Strings use MiniMessage format (colors, decorations) with named
- * placeholders like <title>. Keys missing from the admin's file fall
+ * placeholders like {@code <title>}. Keys missing from the admin's file fall
  * back to the defaults embedded in the jar, so a partial translation
  * never breaks the plugin.
  */
@@ -59,7 +57,7 @@ public class Messages {
 
     /**
      * The raw configured string, with no MiniMessage parsing.
-     *
+     * <p>
      * For values that are data rather than display text (a glyph ramp, a
      * symbol set). Going through Component and back would drag in the plain
      * serializer for no benefit, and would silently mangle any value that
@@ -96,7 +94,7 @@ public class Messages {
 
     /**
      * Parses one MiniMessage string, surviving a malformed one.
-     *
+     * <p>
      * messages.yml is hand-edited, and a mistyped tag makes MiniMessage throw
      * an UNCHECKED exception — which would otherwise escape into a command
      * handler or an event callback and break the feature entirely. Falling
@@ -124,19 +122,5 @@ public class Messages {
      */
     public Component item(String key, TagResolver... resolvers) {
         return get(key, resolvers).decoration(TextDecoration.ITALIC, false);
-    }
-
-    /** Deserializes a list-valued key (e.g. multi-line usage text). */
-    public List<Component> getList(String key, TagResolver... resolvers) {
-        List<String> raw = state.config().getStringList(key);
-        if (raw.isEmpty()) {
-            warnOnce(key, "messages.yml has no list at '" + key
-                    + "'. Delete messages.yml to regenerate it.");
-        }
-        List<Component> out = new ArrayList<>(raw.size());
-        for (String line : raw) {
-            out.add(render(key, line, resolvers));
-        }
-        return out;
     }
 }

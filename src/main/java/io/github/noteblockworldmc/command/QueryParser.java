@@ -14,10 +14,10 @@ import java.util.Locale;
 /**
  * Parses free text + flags into a SongQuery. Shared by /nbw search and the
  * GUI search dialog so flag syntax behaves identically in both.
- *
- * Flags: --sort <recent|popular|random|title|duration|count>
- *        --order <asc|desc>  --category <n>  --downloaded
- *
+ * <p>
+ * Flags: {@code --sort <recent|popular|random|title|duration|count>}
+ *        {@code --order <asc|desc>  --category <n>  --downloaded}
+ * <p>
  * There is no --page flag: every consumer is the GUI, which has page buttons.
  */
 public final class QueryParser {

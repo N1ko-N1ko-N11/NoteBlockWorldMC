@@ -23,13 +23,13 @@ public record PlayableNote(int instrument, float pitch, float volume, int octave
     /**
      * Whether this note plays a custom instrument sample rather than a
      * vanilla one.
-     *
+     * <p>
      * INVARIANT: instrument == -1 exactly when customIndex >= 0 — the parser
      * always sets the two together. Consumers should call this rather than
      * testing either field directly, so the two checks can never drift apart.
-     *
-     * The parser and the compatibility getNotesAt API use these records.
-     * Playback and analysis read NbsSong's primitive arrays directly. Ranges
+     * <p>
+     * The parser builds songs from these records. Playback and analysis
+     * read NbsSong's primitive arrays directly. Ranges
      * are enforced at parse time and when NbsSong packs the narrow arrays.
      */
     public boolean isCustom() {

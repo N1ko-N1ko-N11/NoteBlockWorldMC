@@ -18,7 +18,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 /**
  * Per-player music volume (0-100), applied per listener at playback time —
  * so during a broadcast, everyone hears the concert at their own level.
- *
+ * <p>
  * 100 is the default and is deliberately NOT stored: only deviations are
  * persisted to volumes.yml, so setting a player back to 100 erases their
  * entry rather than pinning a redundant value.
@@ -131,6 +131,6 @@ public class VolumeManager {
     }
 
     private static int clamp(int volume) {
-        return Math.max(0, Math.min(100, volume));
+        return Math.clamp(volume, 0, 100);
     }
 }

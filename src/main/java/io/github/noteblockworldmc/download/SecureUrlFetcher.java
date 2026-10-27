@@ -114,8 +114,10 @@ public final class SecureUrlFetcher implements AutoCloseable {
             try { count = Long.parseLong(size, 16); } catch (NumberFormatException e) { throw new IOException("Invalid chunk", e); }
             if (count < 0 || count > maxBytes - out.size()) throw new IOException("File exceeds size limit");
             if (count == 0) {
+                // Trailer fields are read and discarded, within their own budget.
                 int[] trailers = {16_384};
-                while (!line(in, trailers).isEmpty()) {}
+                String trailer = line(in, trailers);
+                while (!trailer.isEmpty()) trailer = line(in, trailers);
                 return out.toByteArray();
             }
             copyExactly(in, out, count);
@@ -231,15 +233,12 @@ public final class SecureUrlFetcher implements AutoCloseable {
             // NAT64 well-known prefix (64:ff9b::/96) carries the v4 target
             // in the last 4 bytes; an IPv6-only network's NAT64 gateway
             // would translate toward it.
-            if ((bytes[0] & 0xFF) == 0x00 && (bytes[1] & 0xFF) == 0x64
+            return (bytes[0] & 0xFF) == 0x00 && (bytes[1] & 0xFF) == 0x64
                     && (bytes[2] & 0xFF) == 0xFF && (bytes[3] & 0xFF) == 0x9B
                     && bytes[4] == 0 && bytes[5] == 0 && bytes[6] == 0
                     && bytes[7] == 0 && bytes[8] == 0 && bytes[9] == 0
-                    && bytes[10] == 0 && bytes[11] == 0) {
-                if (embeddedV4Blocked(bytes, 12)) {
-                    return true;
-                }
-            }
+                    && bytes[10] == 0 && bytes[11] == 0
+                    && embeddedV4Blocked(bytes, 12);
         }
         return false;
     }

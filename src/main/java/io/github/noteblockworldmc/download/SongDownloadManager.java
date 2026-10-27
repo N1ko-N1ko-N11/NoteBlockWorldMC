@@ -37,13 +37,13 @@ import java.util.zip.ZipInputStream;
 
 /**
  * Downloads and stores packed songs from Note Block World.
- *
+ * <p>
  * Flow: /song/{id}/open (header src: downloadButton) -> signed file URL
  * -> download zip -> extract into plugins/NoteblockWorldMC/songs/{publicId}/
- *
+ * <p>
  * Zip layout (fixed by the server's packer): song.nbs at the root,
  * custom instrument audio under sounds/.
- *
+ * <p>
  * Everything here runs off the main thread except the constructor;
  * callers are responsible for hopping back before touching Bukkit.
  */
@@ -107,7 +107,6 @@ public class SongDownloadManager {
      */
     public record LibraryReconciliation(Set<String> removed, Set<String> added,
                                         boolean successful) {
-        public boolean changed() { return !removed.isEmpty() || !added.isEmpty(); }
     }
 
     public SongDownloadManager(NoteblockWorldMCPlugin plugin) {
@@ -194,7 +193,7 @@ public class SongDownloadManager {
 
     /**
      * Reconciles the in-memory local-library index with the files on disk.
-     *
+     * <p>
      * The manager is deliberately retained across /nbw reload, so the startup
      * directory scan is not enough: an administrator can remove or replace a
      * song while the server is running. Disk reads run on a worker without the
@@ -203,7 +202,7 @@ public class SongDownloadManager {
      * title and local-page caches are rebuilt, and every parsed-song cache entry
      * is invalidated because an existing song file may have been replaced, not
      * merely deleted.
-     *
+     * <p>
      * A failed scan leaves the previous index untouched. That is safer than
      * treating a transient I/O error as proof that every song disappeared.
      */
@@ -360,7 +359,7 @@ public class SongDownloadManager {
 
     /**
      * Resolves a user-typed song reference to public IDs.
-     *
+     * <p>
      * Tried in order, stopping at the first that yields anything:
      * exact ID, exact title (case-insensitive), then substring of a title.
      * Returns every match so callers can report ambiguity rather than
@@ -404,12 +403,12 @@ public class SongDownloadManager {
 
     /**
      * Imports a local .nbs file into the library.
-     *
+     * <p>
      * The file is parsed (which validates it and derives title/author/length),
      * copied to songs/&lt;newId&gt;/song.nbs, and registered exactly like a
      * download so every downstream feature — library view, play-by-name,
      * analyze, the LRU cache — treats it identically.
-     *
+     * <p>
      * NBS contains custom instrument references, not audio. Their notes remain
      * in the parsed song; optional Minecraft-asset recovery can supply samples,
      * otherwise playback reports their unavailability.
@@ -450,15 +449,6 @@ public class SongDownloadManager {
         }
     }
 
-    public String importBytes(byte[] bytes, String fallbackName) throws IOException {
-        return importBytes(bytes, fallbackName, null);
-    }
-    public String importBytes(byte[] bytes, String fallbackName, String overrideName) throws IOException {
-        if (bytes == null) throw new IOException("No song data was supplied");
-        String id = reserveLocalId();
-        try { return importReserved(id, bytes, fallbackName, overrideName); }
-        finally { release(id); }
-    }
     private String importReserved(String id, byte[] bytes, String fallback, String override) throws IOException {
         if (bytes.length > maxZipBytes) throw new IOException("File exceeds size limit");
         NbsSong song;
@@ -610,16 +600,16 @@ public class SongDownloadManager {
     /**
      * Turns a noteblock.world link into the song ID it points at, leaving
      * anything that is not a link untouched.
-     *
+     * <p>
      * People copy the address bar rather than hunting for the ID inside it, so
-     * "https://noteblock.world/song/s4S4kBoWob" is accepted anywhere a bare
+     * {@code https://noteblock.world/song/s4S4kBoWob} is accepted anywhere a bare
      * "s4S4kBoWob" is.
-     *
+     * <p>
      * Only the ID is taken from the text. The download still goes to the
      * configured api-base-url, never to the pasted address, so a link naming
      * some other host cannot redirect a fetch anywhere -- it simply yields an
      * ID that the API will or will not recognise.
-     *
+     * <p>
      * Input that looks like a link but carries no usable ID is returned
      * unchanged, so the caller's normal "song not found" path reports it
      * rather than a second, more confusing error.
@@ -636,19 +626,19 @@ public class SongDownloadManager {
     /**
      * Tries to supply an imported song's custom instruments from Minecraft's
      * own sounds.
-     *
+     * <p>
      * A .nbs names its custom instruments but cannot contain them, so an
      * import arrives with the names and no audio and those notes fall silent.
      * A download from noteblock.world does not have this problem because it
      * ships a zip with a sounds/ folder -- and because that site only accepts
      * instruments that already exist in Minecraft.
-     *
+     * <p>
      * That last point is what makes this recoverable at all: if a declared
      * path names a real Minecraft sound, the audio can be fetched from
      * Mojang's CDN, exactly as the octave variants already are. Anything that
      * is NOT a Minecraft sound (someone's own recording) cannot be recovered
      * by any means, and is reported instead of silently ignored.
-     *
+     * <p>
      * Off by default: it reaches out to the network during an import, and an
      * operator should choose that rather than discover it.
      */
@@ -757,7 +747,7 @@ public class SongDownloadManager {
 
     /**
      * Strips control characters from untrusted text before it reaches the log.
-     *
+     * <p>
      * Custom instrument paths are arbitrary strings out of a .nbs file, and a
      * newline in one would let a crafted song forge console lines.
      */
@@ -768,11 +758,11 @@ public class SongDownloadManager {
 
     /**
      * Title for an imported song.
-     *
+     * <p>
      * An explicit override wins; then the title stored inside the .nbs; then
      * the source file name minus its extension. The raw ID is a last resort
      * only — it is meaningless to a human and shows up in tab completion.
-     *
+     * <p>
      * Shared by the in-memory title index and meta.json on purpose: these
      * were two separate expressions, and they DISAGREED. The index fell back
      * to the ID while meta.json used the file name, so a freshly imported
@@ -833,7 +823,7 @@ public class SongDownloadManager {
                 .thenCompose(bytes -> plugin.getWorkPool().submit(() -> {
                     try { return extract(publicId, bytes, preview); }
                     catch (IOException e) { throw new UncheckedIOException(e); }
-                })).whenComplete((path, error) -> {
+                })).whenComplete((_, error) -> {
                     release(publicId);
                     if (error == null && !plugin.isStopping()) {
                         try {
@@ -850,7 +840,7 @@ public class SongDownloadManager {
         // Registered before observing completion, so a download that already
         // finished removes its own entry immediately.
         activeDownloads.put(publicId, result);
-        result.whenComplete((path, error) -> activeDownloads.remove(publicId, result));
+        result.whenComplete((_, _) -> activeDownloads.remove(publicId, result));
         return result;
     }
 
@@ -1189,7 +1179,7 @@ public class SongDownloadManager {
 
     private void requestTrashCleanup() {
         if (plugin.isStopping() || !trashCleanupPending.compareAndSet(false, true)) return;
-        plugin.getWorkPool().run(this::cleanTrash).whenComplete((unused, error) -> {
+        plugin.getWorkPool().run(this::cleanTrash).whenComplete((_, error) -> {
             trashCleanupPending.set(false);
             if (error != null && !plugin.isStopping())
                 plugin.getLogger().warning("Trash cleanup deferred; will retry automatically: " + error);
@@ -1284,7 +1274,7 @@ public class SongDownloadManager {
 
     /**
      * Records what we know about a downloaded song.
-     *
+     * <p>
      * A preview is only available when the download started from a search
      * result or the GUI. Downloading by raw ID -- "/nbw download aBcD123456"
      * -- has none, and this used to write nothing but the ID, leaving the

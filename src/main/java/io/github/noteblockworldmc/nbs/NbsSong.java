@@ -180,7 +180,7 @@ public final class NbsSong {
 
     /**
      * How many times the song repeats after its first play-through.
-     *
+     * <p>
      * Straight from the NBS header, where OpenNBS defines it as "the amount
      * of times to loop". 1 therefore means the song is heard twice, not once.
      * 0 means loop forever.
@@ -212,12 +212,6 @@ public final class NbsSong {
         if (i < 0) i = -i - 2;
         return tempoTicks[i] + (Math.max(0, seconds) - tempoSeconds[i]) * tempoRates[i];
     }
-    /** Index of the next occupied tick, avoiding scans through millions of silent ticks. */
-    public int nextNoteTick(int after) {
-        int i = java.util.Arrays.binarySearch(noteTicks, after);
-        i = i >= 0 ? i + 1 : -i - 1;
-        return i < noteTicks.length ? noteTicks[i] : Integer.MAX_VALUE;
-    }
     /** Allocation-free chord and note access for playback and analysis. Arrays remain private. */
     public int chordCount() { return noteTicks.length; }
     public int chordTick(int chord) { return noteTicks[chord]; }
@@ -241,24 +235,19 @@ public final class NbsSong {
 
     /**
      * Keeps a tempo inside the range songs can legitimately use.
-     *
+     * <p>
      * The ceiling tracks Note Block Studio's own authoring limit, raised to
      * 180 t/s (2700 BPM) in 3.12. It was 100 here, which silently played any
      * faster song at up to 44% below its intended speed rather than rejecting
      * it. The clamp still exists to contain corrupt values -- the file format
      * can express far higher tempos than anyone can author.
-     *
+     * <p>
      * Note that at 180 t/s a song tick is only 5.6 ms, so playback-precision-ms
      * needs to be well below that for the timing to be meaningful.
      */
     public static double clampTempo(double tempo) {
         if (tempo <= 0 || !Double.isFinite(tempo)) return 10.0;
-        return Math.max(0.2, Math.min(180.0, tempo));
-    }
-
-    /** The tempo change taking effect at this tick, or null. */
-    public Double getTempoChangeAt(int tick) {
-        return tempoChanges.get(tick);
+        return Math.clamp(tempo, 0.2, 180.0);
     }
 
     public String getName() {
@@ -283,23 +272,6 @@ public final class NbsSong {
      */
     public double getDurationSeconds() {
         return durationSeconds;
-    }
-
-    /**
-     * Compatibility list of the notes starting at a tick, in original order.
-     * Performance-sensitive callers use the chord ranges and indexed getters.
-     */
-    public List<PlayableNote> getNotesAt(int tick) {
-        int i = java.util.Arrays.binarySearch(noteTicks, tick);
-        if (i < 0) return List.of();
-        int from = noteStart[i];
-        int to = noteStart[i + 1];
-        List<PlayableNote> notes = new java.util.ArrayList<>(to - from);
-        for (int n = from; n < to; n++) {
-            notes.add(new PlayableNote(noteInstrument[n], notePitch[n], noteVolume[n],
-                    noteOctave[n], noteCustomIndex[n], notePan[n]));
-        }
-        return notes;
     }
 
     public int getSkippedCustomNotes() {

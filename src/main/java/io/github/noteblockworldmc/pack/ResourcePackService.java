@@ -39,7 +39,7 @@ import java.util.zip.ZipOutputStream;
  * Generates and hosts a resource pack containing rate-shifted vanilla samples
  * and custom instrument audio. Original samples plus up to three shifted
  * octaves either side cover the NBS pitch range with Minecraft's runtime pitch.
- *
+ * <p>
  * Immutable pack files, SHA-1, and the generated event set are published together. Rebuilds
  * run off-thread; per-push IDs keep stale resource-pack acknowledgements from
  * opening playback's pack gate. An inspection ZIP is also written to disk.
@@ -97,7 +97,7 @@ public class ResourcePackService implements Listener {
     /**
      * Strict removal: re-push the pack when songs are removed, so online
      * players never keep stale sounds.
-     *
+     * <p>
      * Off by default. A re-push makes every online player re-download the
      * pack and reload resources — a large bandwidth spike and an audible
      * interruption — to clear sounds that nothing can trigger any more,
@@ -148,7 +148,7 @@ public class ResourcePackService implements Listener {
     private final Map<UUID, Long> resolvedAtMillis = new ConcurrentHashMap<>();
     /**
      * When each player was last sent a pack and has not answered yet.
-     *
+     * <p>
      * Playback is gated on a player being "settled", and nothing ever released
      * that gate on its own: a client that never reports a status stayed
      * unsettled for the rest of the session, which silenced every song for
@@ -158,7 +158,7 @@ public class ResourcePackService implements Listener {
 
     /**
      * When the library last invalidated every client's pack, or 0.
-     *
+     * <p>
      * There is a gap between invalidating and pushing: the rebuild is
      * debounced so a burst of downloads costs one client reload rather than
      * several. During that gap a player has no resolution AND no outstanding
@@ -185,8 +185,8 @@ public class ResourcePackService implements Listener {
     /**
      * Turns the configured public-url into the address clients actually fetch
      * from. "auto" (or "auto:PORT") asks the OS which outbound IP this machine
-     * uses and builds "http://THAT_IP:port/pack.zip" from it.
-     *
+     * uses and builds {@code http://THAT_IP:port/pack.zip} from it.
+     * <p>
      * This is a convenience for simple single-server setups, and it comes with
      * real caveats, so it is opt-in rather than the default:
      *  - It returns the machine's PRIMARY outbound IP. Behind NAT (most home
@@ -222,7 +222,7 @@ public class ResourcePackService implements Listener {
 
     /**
      * The IP this machine would use to reach the outside world.
-     *
+     * <p>
      * Opening a UDP socket to a public address forces the OS to select an
      * outbound interface WITHOUT sending a single packet -- no traffic leaves,
      * nothing on the far side is contacted. This beats getLocalHost(), which
@@ -328,7 +328,7 @@ public class ResourcePackService implements Listener {
             plugin.getWorkPool().run(() -> {
                 try { expireGenerations(System.currentTimeMillis()); }
                 catch (IOException e) { throw new java.util.concurrent.CompletionException(e); }
-            }).whenComplete((unused, error) -> {
+            }).whenComplete((_, error) -> {
                 cleanupPending.set(false);
                 if (error != null && !plugin.isStopping()) plugin.getLogger().warning("Pack cleanup failed: " + error);
             });
@@ -346,7 +346,7 @@ public class ResourcePackService implements Listener {
 
     /**
      * Binds the listener a reload asks for while the current one keeps serving.
-     *
+     * <p>
      * Moving between the wildcard and one interface on the SAME port (the
      * 0.0.0.0 to 127.0.0.1 reverse-proxy switch config.yml recommends) can
      * never overlap: the OS refuses the second bind while the first listens,
@@ -431,7 +431,7 @@ public class ResourcePackService implements Listener {
     }
 
     private void untrackKey(String key) {
-        trustedSources.computeIfPresent(key, (k, n) -> n <= 1 ? null : n - 1);
+        trustedSources.computeIfPresent(key, (_, n) -> n <= 1 ? null : n - 1);
     }
 
     /**
@@ -478,7 +478,7 @@ public class ResourcePackService implements Listener {
                 requestCounts.entrySet().removeIf(e -> now - e.getValue()[0] > 60_000);
                 if (requestCounts.size() >= 10_000) return true;
             }
-            long[] window = requestCounts.computeIfAbsent(ip, key -> new long[]{now, 0});
+            long[] window = requestCounts.computeIfAbsent(ip, _ -> new long[]{now, 0});
             if (now - window[0] > 60_000) { window[0] = now; window[1] = 0; }
             return ++window[1] > rateLimitPerMinute;
         }
@@ -497,7 +497,7 @@ public class ResourcePackService implements Listener {
 
     /**
      * Full shutdown, for plugin disable.
-     *
+     * <p>
      * Removes only this instance's installed/pending client packs, including
      * during a full plugin reload. Hot configuration changes use stopServer().
      */
@@ -525,7 +525,7 @@ public class ResourcePackService implements Listener {
     /**
      * Releases the port and its thread pool, leaving the rest of the service
      * usable so the pack can be switched back on without a restart.
-     *
+     * <p>
      * Players already holding the pack keep it until they reconnect; there is
      * no removal request here, and taking it away mid-session
      * would silence any song using custom sounds.
@@ -558,7 +558,7 @@ public class ResourcePackService implements Listener {
             } catch (Exception e) {
                 plugin.getLogger().warning("Could not fetch vanilla note-block sounds: " + e);
             }
-        }).whenComplete((unused, error) -> {
+        }).whenComplete((_, error) -> {
             // Admission can fail before the worker runs, so worker-only
             // cleanup would permanently suppress every subsequent retry.
             fetchingVanilla.set(false);
@@ -577,29 +577,14 @@ public class ResourcePackService implements Listener {
         return vanillaSounds.sampleSeconds(INSTRUMENT_NAMES[instrument]);
     }
 
-    /** True if the pack actually contains this sound event. */
-    public boolean hasEvent(String event) {
-        PackData current = pack;
-        return current != null && event != null && current.events().contains(event);
-    }
-
     /** Availability and duration belong to the generation this particular listener acknowledged. */
     public boolean hasEvent(UUID playerId, String event) {
         Installed current = installed.get(playerId);
         return current != null && current.events().contains(event);
     }
-    public double eventSeconds(UUID playerId, String event) {
-        Installed current = installed.get(playerId);
-        return current == null ? -1 : current.seconds().getOrDefault(event, -1.0);
-    }
     public Map<String, Double> eventDurations(UUID listener) {
         if (listener == null) { PackData current = pack; return current == null ? Map.of() : current.seconds(); }
         Installed current = installed.get(listener); return current == null ? Map.of() : current.seconds();
-    }
-
-    public double eventSeconds(String event) {
-        PackData current = pack;
-        return current == null ? -1 : current.seconds().getOrDefault(event, -1.0);
     }
 
     public String getPackSha1() {
@@ -637,12 +622,6 @@ public class ResourcePackService implements Listener {
         }
     }
 
-    /** Transport selected for the active listener, useful when diagnosing a host-specific issue. */
-    public String getTransportName() {
-        PackHttpServer current = httpServer;
-        return current == null ? "(inactive)" : current.name();
-    }
-
     /** URL a browser can use to download the current pack; Minecraft adds its hash automatically. */
     public String getDownloadUrl() {
         PackData current = pack;
@@ -667,7 +646,7 @@ public class ResourcePackService implements Listener {
 
     /**
      * Like {@link #isResolved}, but also waits out the settle delay.
-     *
+     * <p>
      * SUCCESSFULLY_LOADED fires when the client APPLIES the pack, which is
      * not quite when it has finished tearing down the "Loading resources"
      * screen — notes played in that window can be missed. So playback waits
@@ -680,7 +659,7 @@ public class ResourcePackService implements Listener {
 
     /**
      * Whether a song that is ALREADY playing should reach this player.
-     *
+     * <p>
      * Unlike {@link #isSettled}, a rebuild that has been requested but not yet
      * pushed does not count: the client still has the pack it had a moment
      * ago, so muting it only cut every running song for the debounce, build
@@ -719,15 +698,11 @@ public class ResourcePackService implements Listener {
             return now - sentAt >= RESOLUTION_TIMEOUT_MS;
         }
 
-        if (rebuildComing) {
-            // The library changed and the debounced rebuild has not pushed
-            // yet. Hold, so the song starts with the pack it expects.
-            return false;
-        }
-
-        // Nothing outstanding and no rebuild coming: there is nothing to wait
-        // for. Letting them hear the song without the pack beats silence.
-        return true;
+        // If the library changed and the debounced rebuild has not pushed
+        // yet, hold, so the song starts with the pack it expects. Otherwise
+        // nothing is outstanding: hearing the song without the pack beats
+        // silence.
+        return !rebuildComing;
     }
 
     /** Serializes builds without holding the HTTP admission or generation lookup locks. */
@@ -818,7 +793,7 @@ public class ResourcePackService implements Listener {
 
     /**
      * Builds and publishes the pack on a worker, then sends it on the main thread.
-     *
+     * <p>
      * Mirrors what doRebuildAndPush already does for runtime library changes;
      * startup was the one path still doing this work inline.
      *
@@ -983,14 +958,14 @@ public class ResourcePackService implements Listener {
     /**
      * The identifying part of a custom sound path: the whole relative path,
      * minus the .ogg extension, with separators and dot segments normalised.
-     *
+     * <p>
      * The directories are deliberately KEPT. NBS v5 lets a song reference
      * sounds in subfolders, so "drums/kick.ogg" and "effects/kick.ogg" are two
      * different sounds; reducing both to "kick" gave them the same event, and
      * the duplicate guard in the pack builder then dropped the second one
      * silently -- the song played with one of its instruments missing and
      * nothing said why.
-     *
+     * <p>
      * The complete canonical path is hashed below, so separators and literal
      * underscores remain distinct without a lossy sanitising transform.
      */
@@ -1015,7 +990,6 @@ public class ResourcePackService implements Listener {
     }
 
     /** Returns the stable digest used for a namespaced key component. */
-    public static String sanitizeKeyPart(String input) { return digestKey(input); }
     private static String digestKey(String input) {
         try { return java.util.HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256")
                 .digest(input.getBytes(StandardCharsets.UTF_8))); }
@@ -1154,12 +1128,12 @@ public class ResourcePackService implements Listener {
             written += count;
         }
         @Override public void write(int value) throws IOException { admit(1); out.write(value); }
-        @Override public void write(byte[] data, int from, int length) throws IOException { admit(length); out.write(data, from, length); }
+        @Override public void write(byte @org.jetbrains.annotations.NotNull [] data, int from, int length) throws IOException { admit(length); out.write(data, from, length); }
     }
 
     /**
      * Octave-shifted copies of the vanilla note block sounds.
-     *
+     * <p>
      * These MUST be real audio files: Minecraft clamps the final sound
      * pitch to [0.5, 2.0], and a pack "pitch" multiplier is folded into
      * that value BEFORE the clamp — so multipliers can never reach outside
@@ -1192,7 +1166,7 @@ public class ResourcePackService implements Listener {
     /**
      * Injects downloaded songs' custom instrument sounds, plus an
      * octave-shifted copy of each (same reasoning as the vanilla ones).
-     *
+     * <p>
      * NOTE: noteblock.world names these files by Mojang asset hash with NO
      * extension — filtering by "*.ogg" finds nothing. Content is sniffed
      * via the OggS magic bytes instead.
@@ -1275,11 +1249,11 @@ public class ResourcePackService implements Listener {
 
     /**
      * Call after a custom-sound song is REMOVED.
-     *
+     * <p>
      * Strict mode (repush-on-remove: true): identical to a library
      * addition — rebuild, reset resolution, re-push — so online players
      * never keep stale sounds, at the cost of one client reload each.
-     *
+     * <p>
      * Lenient mode: quiet rebuild only; new joiners get the lean pack,
      * online players keep a harmless superset until the next push.
      */
@@ -1305,7 +1279,7 @@ public class ResourcePackService implements Listener {
         plugin.getWorkPool().run(() -> {
             try { rebuild(); }
             catch (Exception e) { throw new java.util.concurrent.CompletionException(e); }
-        }).whenComplete((unused, error) -> {
+        }).whenComplete((_, error) -> {
             if (plugin.isStopping()) return;
             // Admission failure means the build never ran. Pushing the previous
             // generation and forgetting the change left a newly added song's

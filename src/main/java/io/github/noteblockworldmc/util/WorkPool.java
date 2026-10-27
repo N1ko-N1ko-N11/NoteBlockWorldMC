@@ -21,7 +21,7 @@ public final class WorkPool implements AutoCloseable {
                 new RejectedExecutionException("A request is already in progress; please wait"));
         CompletableFuture<T> result = new CompletableFuture<>();
         pending.add(result);
-        result.whenComplete((v, e) -> { pending.remove(result); if (owner != null) owners.remove(owner); });
+        result.whenComplete((_, _) -> { pending.remove(result); if (owner != null) owners.remove(owner); });
         try {
             executor.execute(() -> {
                 if (result.isDone()) return;

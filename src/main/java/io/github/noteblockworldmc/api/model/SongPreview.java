@@ -89,16 +89,16 @@ public class SongPreview {
         // Titles and authors already drop the section sign; descriptions kept
         // it, so uploaded text could recolour or obfuscate (§k) lore and chat.
         return description == null ? "" : sanitize(description.substring(0, Math.min(4096, description.length())))
-                .replace('\u00A7', ' ');
+                .replace('§', ' ');
     }
 
     /** Precompiled: sanitize runs per title per GUI render and per search hit. */
     private static final Pattern STRIP_CONTROL =
-            Pattern.compile("[[\\p{Cc}\\p{Cf}]&&[^\n]]");
+            Pattern.compile("[\\p{Cc}\\p{Cf}&&[^\n]]");
 
     /**
      * Cleans text coming from the web API for safe rendering in Minecraft chat.
-     *
+     * <p>
      * Normalizes Windows (\r\n) and old Mac (\r) line endings to \n, then
      * strips other control and format characters such as zero-width spaces.
      */

@@ -4,7 +4,31 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="6be6e0a1-c1f6-468b-a802-0df1cd86542a" name="Changes" comment="Issue fixes (hopefully)" />
+    <list default="true" id="6be6e0a1-c1f6-468b-a802-0df1cd86542a" name="Changes" comment="Quite a bunch stuff had changed (honestly, because I kept the plugin passing between GPT-6 Astra and Opus 5.5 to let them have different views every time), but it did fix some of the issues that I've faced, such like duplicated texts and cases where slow players could keep the custom instrument loader busy, as an example among many.">
+      <change beforePath="$PROJECT_DIR$/CHANGELOG.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/tests/ApiCooldownChecks.java" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/tests/EdgeFixChecks.java" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/tests/FixChecks.java" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/tests/FollowupFixChecks.java" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/tests/InterruptedImportFixChecks.java" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/tests/NetworkChecks.java" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/tests/OptimizationChecks.java" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/tests/Port263Checks.java" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/tests/QueuedTuningFixChecks.java" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/tests/RegressionChecks.java" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/tests/RemainingFixChecks.java" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/tests/ReplacedQueueFixChecks.java" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/tests/SetupIndexFixChecks.java" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/tests/TrashRecoveryFixChecks.java" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/tests/WindowsHttpChecks.java" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/tests/fixtures/README.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/tests/fixtures/tone.ogg" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/tests/fixtures/vorbis-48000-2.ogg" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/tests/fixtures/vorbis-8000-1.ogg" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/tests/fixtures/vorbis-96000-2.ogg" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/tests/gui_doubles.py" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/tests/run_regressions.py" beforeDir="false" />
+    </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
     <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
@@ -25,6 +49,9 @@
     &quot;accountId&quot;: &quot;62f268be-0349-4413-a0a6-ab1f7400963c&quot;
   }
 }</component>
+  <component name="ProblemsViewState">
+    <option name="selectedTabId" value="CurrentFile" />
+  </component>
   <component name="ProjectColorInfo">{
   &quot;associatedIndex&quot;: 4,
   &quot;fromUser&quot;: false
@@ -70,6 +97,7 @@
   </component>
   <component name="VcsManagerConfiguration">
     <MESSAGE value="Issue fixes (hopefully)" />
-    <option name="LAST_COMMIT_MESSAGE" value="Issue fixes (hopefully)" />
+    <MESSAGE value="Quite a bunch stuff had changed (honestly, because I kept the plugin passing between GPT-6 Astra and Opus 5.5 to let them have different views every time), but it did fix some of the issues that I've faced, such like duplicated texts and cases where slow players could keep the custom instrument loader busy, as an example among many." />
+    <option name="LAST_COMMIT_MESSAGE" value="Quite a bunch stuff had changed (honestly, because I kept the plugin passing between GPT-6 Astra and Opus 5.5 to let them have different views every time), but it did fix some of the issues that I've faced, such like duplicated texts and cases where slow players could keep the custom instrument loader busy, as an example among many." />
   </component>
 </project>

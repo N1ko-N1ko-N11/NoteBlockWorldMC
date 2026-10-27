@@ -28,13 +28,13 @@ import java.util.Map;
  * playing, volume), and diagnostics (analyze, packinfo, config, reload,
  * help). play and stop take an optional leading target ("@a" or a player
  * name).
- *
+ * <p>
  * Registered through Paper's Brigadier {@link BasicCommand} API: the Bukkit
  * CommandExecutor/TabCompleter/plugin.yml command path is obsolete as of
  * Paper 26.3.
- *
- * Search flags: --sort <recent|popular|random|title|duration|count>
- *               --order <asc|desc>  --category <name>  --downloaded
+ * <p>
+ * Search flags: {@code --sort <recent|popular|random|title|duration|count>}
+ *               {@code --order <asc|desc>  --category <name>  --downloaded}
  */
 public class SongsCommand implements BasicCommand {
 
@@ -43,7 +43,7 @@ public class SongsCommand implements BasicCommand {
     public static final String DESCRIPTION = "Browse, download, and play songs from noteblock.world";
 
     private void runBackground(org.bukkit.command.CommandSender sender, Runnable work) {
-        plugin.getWorkPool().run(sender, work).whenComplete((value, error) -> {
+        plugin.getWorkPool().run(sender, work).whenComplete((_, error) -> {
             if (error != null && !plugin.isStopping()) plugin.runMain(() ->
                     sender.sendMessage(net.kyori.adventure.text.Component.text("Music request failed: "
                             + io.github.noteblockworldmc.util.Throwables.describe(error))));
@@ -57,11 +57,13 @@ public class SongsCommand implements BasicCommand {
     }
 
     @Override
+    @org.jspecify.annotations.NullMarked
     public void execute(CommandSourceStack source, String[] args) {
         handle(source.getSender(), LABEL, args);
     }
 
     @Override
+    @org.jspecify.annotations.NullMarked
     public Collection<String> suggest(CommandSourceStack source, String[] args) {
         // Brigadier passes no arguments at all for "/nbw " before anything is
         // typed; the completer below expects the token being typed to exist.
@@ -205,7 +207,7 @@ public class SongsCommand implements BasicCommand {
                 // catalog ID still works and is downloaded on demand below.
                 List<String> local = downloads.resolve(joined);
                 if (local.size() == 1) {
-                    playResolved(player, target, local.get(0));
+                    playResolved(player, target, local.getFirst());
                     return;
                 }
                 if (local.size() > 1) {
@@ -229,7 +231,7 @@ public class SongsCommand implements BasicCommand {
                 player.sendMessage(msg("download.downloading", Placeholder.unparsed("song", id)));
                 var playRequest = plugin.getPlaybackManager().beginPlay(player,
                         target.single() == null ? player : target.single(), target.everyone());
-                downloads.download(id, null).whenComplete((path, throwable) ->
+                downloads.download(id, null).whenComplete((_, throwable) ->
                         plugin.runMain(() -> {
                             if (throwable != null) {
                                 plugin.getPlaybackManager().abandon(playRequest);
@@ -527,7 +529,7 @@ public class SongsCommand implements BasicCommand {
                     return;
                 }
                 try {
-                    plugin.reloadSettings(true).whenComplete((unused, error) -> plugin.runMain(() -> {
+                    plugin.reloadSettings(true).whenComplete((_, error) -> plugin.runMain(() -> {
                         if (error != null) {
                             sender.sendMessage(msg("general.reload-failed",
                                     Placeholder.unparsed("reason", Throwables.describe(error))));
@@ -609,7 +611,7 @@ public class SongsCommand implements BasicCommand {
                     Placeholder.unparsed("matches", names)));
             return null;
         }
-        return matches.get(0);
+        return matches.getFirst();
     }
 
     private void sendAnalysis(org.bukkit.entity.Player player,
@@ -663,7 +665,7 @@ public class SongsCommand implements BasicCommand {
      * Renders the concurrency curve as a bar strip, scaled to the song's own
      * busiest slice -- so it shows WHERE the load sits, not how it compares to
      * the channel budget (the verdict lines already cover that).
-     *
+     * <p>
      * The glyph ramp lives in messages.yml: block characters are likely but
      * not guaranteed to render in Minecraft's font, and swapping them should
      * not need a code change.
@@ -675,7 +677,7 @@ public class SongsCommand implements BasicCommand {
         if (max <= 0) return "";
 
         String ramp = plugin.getMessages()
-                .getRaw("analyze.density-ramp", "\u2581\u2582\u2583\u2584\u2585\u2586\u2587\u2588");
+                .getRaw("analyze.density-ramp", "▁▂▃▄▅▆▇█");
         if (ramp.isEmpty()) return "";
 
         StringBuilder out = new StringBuilder(density.length);
@@ -685,7 +687,7 @@ public class SongsCommand implements BasicCommand {
             // across the remaining glyphs, peaking exactly at the top one.
             int index = value <= 0 ? 0
                     : 1 + (int) Math.round((ramp.length() - 2) * (value / max));
-            out.append(ramp.charAt(Math.max(0, Math.min(ramp.length() - 1, index))));
+            out.append(ramp.charAt(Math.clamp(index, 0, ramp.length() - 1)));
         }
         return out.toString();
     }
@@ -702,7 +704,7 @@ public class SongsCommand implements BasicCommand {
     /**
      * A parsed /nbw play target: who the song should play for, and the song
      * arguments with any leading target token removed.
-     *
+     * <p>
      * The first token is treated as a target only when it is "@a" or the exact
      * name of an online player. Anything else -- including a song whose name
      * happens to be one word -- is left as part of the song query, so the bare
@@ -754,7 +756,7 @@ public class SongsCommand implements BasicCommand {
 
     /**
      * Lists the settings that can be changed in game.
-     *
+     * <p>
      * The editor exposes playback controls because they are useful to tune from
      * in-game. Other settings stay in config.yml and are applied by /nbw reload;
      * that includes the API endpoint, HTTP timeouts, download limits, and pack

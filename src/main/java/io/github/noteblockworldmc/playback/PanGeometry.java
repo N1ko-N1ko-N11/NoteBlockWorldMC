@@ -2,7 +2,7 @@ package io.github.noteblockworldmc.playback;
 
 /**
  * Where to place a panned note around the listener.
- *
+ * <p>
  * Minecraft has no pan control; a positional sound is panned by the client
  * from the DIRECTION it arrives from, relative to the camera. Distance only
  * changes loudness, so a note placed directly to the side pans fully however
@@ -29,7 +29,7 @@ final class PanGeometry {
 
     /** Offset at {@code radius} whose direction gives sin(azimuth) = pan. */
     static double[] offset(double pan, double radius, double[] forward, double[] right) {
-        double sin = Math.max(-1, Math.min(1, pan)), cos = Math.sqrt(1 - sin * sin);
+        double sin = Math.clamp(pan, -1, 1), cos = Math.sqrt(1 - sin * sin);
         return new double[]{radius * (cos * forward[0] + sin * right[0]),
                 radius * (cos * forward[1] + sin * right[1]),
                 radius * (cos * forward[2] + sin * right[2])};

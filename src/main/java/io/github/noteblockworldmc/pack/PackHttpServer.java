@@ -22,11 +22,9 @@ import java.nio.channels.WritableByteChannel;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.HashSet;
-import java.util.List;
 import java.util.Locale;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ThreadFactory;
@@ -43,7 +41,7 @@ import java.util.function.Predicate;
 
 /**
  * Bounded resource-pack HTTP transport.
- *
+ * <p>
  * The pack itself stays on disk. Linux and other platforms use the bounded
  * selector transport so slow readers do not occupy worker threads. Windows
  * uses the JDK HttpServer transport: the original release used that listener,
@@ -58,16 +56,6 @@ final class PackHttpServer implements AutoCloseable {
     }
 
     private final Transport transport;
-
-    PackHttpServer(InetSocketAddress bind, Function<String, FileChannel> lookup,
-                   Predicate<String> rateLimited, IntSupplier limit) throws IOException {
-        this(bind, lookup, rateLimited, limit, 60_000);
-    }
-
-    PackHttpServer(InetSocketAddress bind, Function<String, FileChannel> lookup,
-                   Predicate<String> rateLimited, IntSupplier limit, long transferMillis) throws IOException {
-        this(bind, lookup, rateLimited, ip -> true, limit, transferMillis);
-    }
 
     /**
      * @param trusted sources (online players' addresses, a local reverse
@@ -98,7 +86,16 @@ final class PackHttpServer implements AutoCloseable {
 
     /** Transfer slots for untrusted sources: half the pool, and a few per address or IPv6 /64. */
     static int untrustedLimit(int maximum) { return Math.max(1, maximum / 2); }
-    static int perSourceLimit(int maximum) { return Math.max(1, Math.min(untrustedLimit(maximum), Math.max(2, maximum / 4))); }
+    static int perSourceLimit(int maximum) {
+        // A quarter of the pool, at least 2, but never more than the shared half.
+        int cap = untrustedLimit(maximum);
+        return Math.clamp(maximum / 4, Math.min(2, cap), cap);
+    }
+
+    /** The configured pool size, kept within 1..cap. */
+    static int poolSize(IntSupplier limit, int cap) {
+        return Math.clamp(limit.getAsInt(), 1, cap);
+    }
 
     /** Thread-safe bookkeeping of untrusted transfers. */
     static final class Admission {
@@ -122,10 +119,8 @@ final class PackHttpServer implements AutoCloseable {
 
         synchronized void release(String key) {
             untrusted--;
-            perSource.computeIfPresent(key, (k, n) -> n <= 1 ? null : n - 1);
+            perSource.computeIfPresent(key, (_, n) -> n <= 1 ? null : n - 1);
         }
-
-        synchronized int active() { return untrusted; }
     }
 
     private static boolean useJdkTransport() {
@@ -185,9 +180,7 @@ final class PackHttpServer implements AutoCloseable {
                 created = HttpServer.create(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0), 32);
                 workers = new ThreadPoolExecutor(0, MAX_WORKERS, 30, TimeUnit.SECONDS,
                         new SynchronousQueue<>(), daemonFactory(), new ThreadPoolExecutor.AbortPolicy());
-                var timer = new ScheduledThreadPoolExecutor(1, daemonFactory());
-                timer.setRemoveOnCancelPolicy(true);
-                timers = timer;
+                timers = deadlineTimer();
                 created.createContext("/pack.zip", this::handle);
                 created.setExecutor(workers);
                 server = created;
@@ -237,7 +230,7 @@ final class PackHttpServer implements AutoCloseable {
                     Socket socket = null;
                     try {
                         socket = listener.accept();
-                        int maximum = Math.min(MAX_WORKERS, Math.max(1, limit.getAsInt()));
+                        int maximum = poolSize(limit, MAX_WORKERS);
                         String ip = socket.getInetAddress().getHostAddress();
                         boolean trusted = admission.trusted(ip);
                         // Applied before header parsing, with a small bounded allowance for
@@ -282,12 +275,13 @@ final class PackHttpServer implements AutoCloseable {
                         InputStream request = new java.io.BufferedInputStream(client.getInputStream(), 4096);
                         byte[] header = new byte[16_384];
                         int size = 0;
-                        while (true) {
+                        boolean complete = false;
+                        while (!complete) {
                             if (size == header.length) { reject(431); return; }
                             int next = request.read(); if (next < 0) return;
                             header[size++] = (byte) next;
-                            if (size >= 4 && header[size - 4] == 13 && header[size - 3] == 10
-                                    && header[size - 2] == 13 && header[size - 1] == 10) break;
+                            complete = size >= 4 && header[size - 4] == 13 && header[size - 3] == 10
+                                    && header[size - 2] == 13 && header[size - 1] == 10;
                         }
                         headersComplete = true; headerExpiry.cancel(false);
                         String raw = new String(header, 0, size, StandardCharsets.US_ASCII);
@@ -296,8 +290,9 @@ final class PackHttpServer implements AutoCloseable {
                                 || !first[1].startsWith("/") || first[1].startsWith("//")
                                 || first[1].chars().anyMatch(c -> c <= 32 || c > 126)) { reject(400); return; }
                         if (!first[0].equals("GET") && !first[0].equals("HEAD")) { reject(405); return; }
-                        int maximum = Math.min(MAX_WORKERS, Math.max(1, limit.getAsInt()));
-                        if (!trusted && !admission.acquire(source, maximum)) { reject(503); return; }
+                        int maximum = poolSize(limit, MAX_WORKERS);
+                        boolean allowed = trusted || admission.acquire(source, maximum);
+                        if (!allowed) { reject(503); return; }
                         reserved = !trusted;
                         if (forwarding.incrementAndGet() > maximum) {
                             forwarding.decrementAndGet(); reject(503); return;
@@ -372,7 +367,7 @@ final class PackHttpServer implements AutoCloseable {
                     return;
                 }
 
-                int maximum = Math.min(MAX_WORKERS, Math.max(1, limit.getAsInt()));
+                int maximum = poolSize(limit, MAX_WORKERS);
                 if (transfers.incrementAndGet() > maximum) {
                     transfers.decrementAndGet();
                     respond(exchange, 503);
@@ -491,7 +486,7 @@ final class PackHttpServer implements AutoCloseable {
             return "NIO selector";
         }
 
-        private final class Connection {
+        private static final class Connection {
             final java.nio.channels.SocketChannel socket;
             final ByteBuffer request = ByteBuffer.allocate(16_384);
             final long accepted = System.nanoTime();
@@ -529,7 +524,7 @@ final class PackHttpServer implements AutoCloseable {
                             }
                             Connection connection = (Connection) key.attachment();
                             if (key.isReadable()) read(key, connection);
-                            if (key.isValid() && key.isWritable()) write(key, connection);
+                            if (key.isValid() && key.isWritable()) write(connection);
                         } catch (IOException | RuntimeException e) {
                             if (key.attachment() instanceof Connection c) drop(c);
                         }
@@ -552,7 +547,7 @@ final class PackHttpServer implements AutoCloseable {
                 java.nio.channels.SocketChannel socket = listener.accept();
                 if (socket == null) return;
                 try {
-                    int maximum = Math.min(64, Math.max(1, limit.getAsInt()));
+                    int maximum = poolSize(limit, 64);
                     String ip = ((InetSocketAddress) socket.getRemoteAddress()).getAddress().getHostAddress();
                     boolean trusted = admission.trusted(ip);
                     long sameKind = connections.stream().filter(c -> c.trusted == trusted).count();
@@ -609,8 +604,9 @@ final class PackHttpServer implements AutoCloseable {
                 return;
             }
             c.body = body;
-            int maximum = Math.min(64, Math.max(1, limit.getAsInt()));
-            if (transfers >= maximum || (!c.trusted && !admission.acquire(c.source, maximum))) {
+            int maximum = poolSize(limit, 64);
+            boolean allowed = transfers < maximum && (c.trusted || admission.acquire(c.source, maximum));
+            if (!allowed) {
                 body.close();
                 c.body = null;
                 respond(key, c, 503, null, false);
@@ -636,7 +632,7 @@ final class PackHttpServer implements AutoCloseable {
             key.interestOps(SelectionKey.OP_WRITE);
         }
 
-        private void write(SelectionKey key, Connection c) throws IOException {
+        private void write(Connection c) throws IOException {
             if (c.headers.hasRemaining()) c.socket.write(c.headers);
             if (c.headers.hasRemaining()) return;
             if (c.position >= c.length) {
@@ -692,6 +688,13 @@ final class PackHttpServer implements AutoCloseable {
                 catch (InterruptedException e) { Thread.currentThread().interrupt(); }
             }
         }
+    }
+
+    /** Deadline timer for the JDK transport; owned and shut down by that transport. */
+    private static ScheduledThreadPoolExecutor deadlineTimer() {
+        var timer = new ScheduledThreadPoolExecutor(1, daemonFactory());
+        timer.setRemoveOnCancelPolicy(true);
+        return timer;
     }
 
     private static ThreadFactory daemonFactory() {
