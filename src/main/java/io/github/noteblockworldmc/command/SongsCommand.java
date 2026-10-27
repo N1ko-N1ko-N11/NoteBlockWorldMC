@@ -11,12 +11,12 @@ import net.kyori.adventure.text.minimessage.tag.resolver.TagResolver;
 import net.kyori.adventure.text.event.ClickEvent;
 import net.kyori.adventure.text.event.HoverEvent;
 import org.bukkit.Bukkit;
-import org.bukkit.command.Command;
-import org.bukkit.command.CommandExecutor;
+import io.papermc.paper.command.brigadier.BasicCommand;
+import io.papermc.paper.command.brigadier.CommandSourceStack;
 import org.bukkit.command.CommandSender;
-import org.bukkit.command.TabCompleter;
 
 import java.util.Arrays;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
@@ -29,10 +29,26 @@ import java.util.Map;
  * help). play and stop take an optional leading target ("@a" or a player
  * name).
  *
+ * Registered through Paper's Brigadier {@link BasicCommand} API: the Bukkit
+ * CommandExecutor/TabCompleter/plugin.yml command path is obsolete as of
+ * Paper 26.3.
+ *
  * Search flags: --sort <recent|popular|random|title|duration|count>
  *               --order <asc|desc>  --category <name>  --downloaded
  */
-public class SongsCommand implements CommandExecutor, TabCompleter {
+public class SongsCommand implements BasicCommand {
+
+    /** Root literal registered with Paper's Brigadier command API. */
+    public static final String LABEL = "nbw";
+    public static final String DESCRIPTION = "Browse, download, and play songs from noteblock.world";
+
+    private void runBackground(org.bukkit.command.CommandSender sender, Runnable work) {
+        plugin.getWorkPool().run(sender, work).whenComplete((value, error) -> {
+            if (error != null && !plugin.isStopping()) plugin.runMain(() ->
+                    sender.sendMessage(net.kyori.adventure.text.Component.text("Music request failed: "
+                            + io.github.noteblockworldmc.util.Throwables.describe(error))));
+        });
+    }
 
     private final NoteblockWorldMCPlugin plugin;
 
@@ -41,7 +57,22 @@ public class SongsCommand implements CommandExecutor, TabCompleter {
     }
 
     @Override
-    public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
+    public void execute(CommandSourceStack source, String[] args) {
+        handle(source.getSender(), LABEL, args);
+    }
+
+    @Override
+    public Collection<String> suggest(CommandSourceStack source, String[] args) {
+        // Brigadier passes no arguments at all for "/nbw " before anything is
+        // typed; the completer below expects the token being typed to exist.
+        return complete(source.getSender(), args.length == 0 ? new String[]{""} : args);
+    }
+
+    /**
+     * Runs one /nbw invocation for {@code sender}. {@code label} is only
+     * used when echoing usage text and clickable commands back.
+     */
+    public void handle(CommandSender sender, String label, String[] args) {
         if (args.length == 0) {
             // Bare /nbw: open the browser GUI (players); console gets usage
             if (sender instanceof org.bukkit.entity.Player player) {
@@ -52,14 +83,14 @@ public class SongsCommand implements CommandExecutor, TabCompleter {
                     // already falls back to permission.none for someone who
                     // holds nothing at all.
                     sendUsage(player, label);
-                    return true;
+                    return;
                 }
                 new io.github.noteblockworldmc.gui.SongBrowserGui(
                         plugin, player, SongQuery.builder().build()).open();
             } else {
                 sendUsage(sender, label);
             }
-            return true;
+            return;
         }
 
         String sub = args[0].toLowerCase(Locale.ROOT);
@@ -69,10 +100,10 @@ public class SongsCommand implements CommandExecutor, TabCompleter {
             case "search" -> {
                 if (!sender.hasPermission("noteblockworldmc.browse")) {
                     sender.sendMessage(msg("permission.browse-catalog"));
-                    return true;
+                    return;
                 }
                 SongQuery query = QueryParser.parse(plugin, sender, rest);
-                if (query == null) return true;
+                if (query == null) return;
                 boolean hasQuery = query.getQ() != null && !query.getQ().isBlank();
                 boolean hasFilters = query.getSort() != null || query.getAscending() != null
                         || query.getCategory() != null || query.isDownloadedOnly();
@@ -88,53 +119,56 @@ public class SongsCommand implements CommandExecutor, TabCompleter {
                         sender.sendMessage(msg("usage.search",
                                 Placeholder.unparsed("label", label)));
                     }
-                    return true;
+                    return;
                 }
                 if (!(sender instanceof org.bukkit.entity.Player player)) {
                     sender.sendMessage(msg("general.players-only-gui"));
-                    return true;
+                    return;
                 }
                 new io.github.noteblockworldmc.gui.SongBrowserGui(plugin, player, query).open();
             }
             case "download" -> {
                 if (rest.length != 1) {
                     sender.sendMessage(msg("usage.download", Placeholder.unparsed("label", label)));
-                    return true;
+                    return;
                 }
                 if (!sender.hasPermission("noteblockworldmc.download")) {
                     sender.sendMessage(msg("permission.download"));
-                    return true;
+                    return;
                 }
                 // A pasted noteblock.world link works as well as a bare ID.
                 String id = SongDownloadManager.extractSongId(rest[0]);
                 var downloads = plugin.getDownloadManager();
                 if (downloads.isDownloaded(id)) {
                     sender.sendMessage(msg("download.already-downloaded"));
-                    return true;
+                    return;
                 }
                 sender.sendMessage(msg("download.downloading", Placeholder.unparsed("song", id)));
                 downloads.download(id, null).whenComplete((path, throwable) ->
-                        Bukkit.getScheduler().runTask(plugin, () -> {
+                        plugin.runMain(() -> {
                             if (throwable != null) {
                                 sender.sendMessage(msg("download.failed",
                                         Placeholder.unparsed("reason", Throwables.describe(throwable))));
                                 return;
                             }
-                            sender.sendMessage(msg("download.downloaded-to", Placeholder.unparsed("path", String.valueOf(path))));
+                            // Players see the file name; the server's directory layout is for the console.
+                            String shown = sender instanceof org.bukkit.entity.Player && path != null
+                                    ? String.valueOf(path.getFileName()) : String.valueOf(path);
+                            sender.sendMessage(msg("download.downloaded-to", Placeholder.unparsed("path", shown)));
                         }));
             }
             case "play" -> {
                 if (!(sender instanceof org.bukkit.entity.Player player)) {
                     sender.sendMessage(msg("general.players-only-play"));
-                    return true;
+                    return;
                 }
                 if (!player.hasPermission("noteblockworldmc.play")) {
                     player.sendMessage(msg("permission.play"));
-                    return true;
+                    return;
                 }
                 if (rest.length == 0) {
                     player.sendMessage(msg("usage.play", Placeholder.unparsed("label", label)));
-                    return true;
+                    return;
                 }
 
                 // Optional leading target: "@a" for everyone, or a player name.
@@ -145,12 +179,12 @@ public class SongsCommand implements CommandExecutor, TabCompleter {
                 if (target.invalid()) {
                     player.sendMessage(msg("playback.target-not-found",
                             Placeholder.unparsed("name", target.rawName())));
-                    return true;
+                    return;
                 }
                 if (target.needsBroadcastPermission()
                         && !player.hasPermission("noteblockworldmc.broadcast")) {
                     player.sendMessage(msg("permission.broadcast"));
-                    return true;
+                    return;
                 }
                 String[] songArgs = target.songArgs();
                 // Resolve a pasted link to its ID before anything else looks at
@@ -161,7 +195,7 @@ public class SongsCommand implements CommandExecutor, TabCompleter {
                 }
                 if (songArgs.length == 0) {
                     player.sendMessage(msg("usage.play", Placeholder.unparsed("label", label)));
-                    return true;
+                    return;
                 }
 
                 var downloads = plugin.getDownloadManager();
@@ -172,11 +206,11 @@ public class SongsCommand implements CommandExecutor, TabCompleter {
                 List<String> local = downloads.resolve(joined);
                 if (local.size() == 1) {
                     playResolved(player, target, local.get(0));
-                    return true;
+                    return;
                 }
                 if (local.size() > 1) {
                     resolveSong(player, songArgs);   // reports the ambiguity
-                    return true;
+                    return;
                 }
                 // Nothing local matched. Only a SINGLE token can plausibly be
                 // a catalog ID worth downloading; a multi-word input was a
@@ -185,29 +219,33 @@ public class SongsCommand implements CommandExecutor, TabCompleter {
                 if (songArgs.length > 1) {
                     player.sendMessage(msg("song.not-found",
                             Placeholder.unparsed("query", joined)));
-                    return true;
+                    return;
                 }
                 String id = songArgs[0];
                 if (!player.hasPermission("noteblockworldmc.download")) {
                     player.sendMessage(msg("permission.download-needed"));
-                    return true;
+                    return;
                 }
                 player.sendMessage(msg("download.downloading", Placeholder.unparsed("song", id)));
+                var playRequest = plugin.getPlaybackManager().beginPlay(player,
+                        target.single() == null ? player : target.single(), target.everyone());
                 downloads.download(id, null).whenComplete((path, throwable) ->
-                        Bukkit.getScheduler().runTask(plugin, () -> {
-                            if (!player.isOnline()) return;
+                        plugin.runMain(() -> {
                             if (throwable != null) {
-                                player.sendMessage(msg("download.failed",
+                                plugin.getPlaybackManager().abandon(playRequest);
+                                if (player.isOnline()) player.sendMessage(msg("download.failed",
                                         Placeholder.unparsed("reason", Throwables.describe(throwable))));
                                 return;
                             }
-                            playResolved(player, target, id);
+                            if (!player.isOnline()) return;
+                            if (plugin.getPlaybackManager().isCurrent(playRequest))
+                                playResolved(player, target, id, playRequest);
                         }));
             }
             case "stop" -> {
                 if (!(sender instanceof org.bukkit.entity.Player player)) {
                     sender.sendMessage(msg("general.players-only-stop"));
-                    return true;
+                    return;
                 }
 
                 // Bare /nbw stop stops the caller's own song. A target ("@a" or
@@ -219,28 +257,27 @@ public class SongsCommand implements CommandExecutor, TabCompleter {
                     } else {
                         player.sendMessage(msg("playback.nothing-playing"));
                     }
-                    return true;
+                    return;
                 }
 
                 if (!player.hasPermission("noteblockworldmc.broadcast")) {
                     // Not permission.broadcast: that message is about PLAYING
                     // to everyone, which reads wrong when refusing a stop.
                     player.sendMessage(msg("permission.stop-others"));
-                    return true;
+                    return;
                 }
                 String targetName = rest[0];
                 if (targetName.equalsIgnoreCase("@a")) {
-                    boolean any = plugin.getPlaybackManager().stopBroadcastFading();
-                    any |= plugin.getPlaybackManager().stopAllPersonalFading();
+                    boolean any = plugin.getPlaybackManager().stopEveryoneFading();
                     sender.sendMessage(any ? msg("playback.stopped-everyone")
                                            : msg("playback.nothing-playing-anywhere"));
-                    return true;
+                    return;
                 }
                 org.bukkit.entity.Player targetPlayer = Bukkit.getPlayerExact(targetName);
                 if (targetPlayer == null) {
                     player.sendMessage(msg("playback.target-not-found",
                             Placeholder.unparsed("name", targetName)));
-                    return true;
+                    return;
                 }
                 if (plugin.getPlaybackManager().stopFading(targetPlayer.getUniqueId())) {
                     player.sendMessage(msg("playback.stopped-target",
@@ -253,35 +290,35 @@ public class SongsCommand implements CommandExecutor, TabCompleter {
             case "categories" -> {
                 if (!sender.hasPermission("noteblockworldmc.browse")) {
                     sender.sendMessage(msg("permission.browse-catalog"));
-                    return true;
+                    return;
                 }
                 fetchCategories(sender, label);
             }
             case "volume" -> {
                 if (!(sender instanceof org.bukkit.entity.Player player)) {
                     sender.sendMessage(msg("general.players-only-volume"));
-                    return true;
+                    return;
                 }
                 if (!player.hasPermission("noteblockworldmc.volume")) {
                     player.sendMessage(msg("permission.volume"));
-                    return true;
+                    return;
                 }
                 if (rest.length == 0) {
                     player.sendMessage(msg("volume.current", Placeholder.unparsed("volume",
                             String.valueOf(plugin.getVolumeManager()
                                     .getVolume(player.getUniqueId())))));
-                    return true;
+                    return;
                 }
                 int value;
                 try {
                     value = Integer.parseInt(rest[0]);
                 } catch (NumberFormatException e) {
                     player.sendMessage(msg("volume.invalid"));
-                    return true;
+                    return;
                 }
                 if (value < 0 || value > 100) {
                     player.sendMessage(msg("volume.invalid"));
-                    return true;
+                    return;
                 }
                 plugin.getVolumeManager().setVolume(player.getUniqueId(), value);
                 player.sendMessage(msg("volume.set",
@@ -290,14 +327,15 @@ public class SongsCommand implements CommandExecutor, TabCompleter {
             case "remove" -> {
                 if (!sender.hasPermission("noteblockworldmc.remove")) {
                     sender.sendMessage(msg("permission.remove"));
-                    return true;
+                    return;
                 }
                 if (rest.length == 0) {
                     sender.sendMessage(msg("usage.remove", Placeholder.unparsed("label", label)));
-                    return true;
+                    return;
                 }
-                String id = resolveSong(sender, rest);
-                if (id == null) return true;   // not found / ambiguous, already reported
+                String exact = String.join(" ", rest).trim();
+                String id = plugin.getDownloadManager().isOrphan(exact) ? exact : resolveSong(sender, rest);
+                if (id == null) return;   // not found / ambiguous, already reported
                 String title = plugin.getDownloadManager().getTitle(id);
                 if (plugin.getDownloadManager().remove(id)) {
                     plugin.getPlaybackManager().invalidateCache(id);
@@ -309,31 +347,23 @@ public class SongsCommand implements CommandExecutor, TabCompleter {
             case "import" -> {
                 if (!sender.hasPermission("noteblockworldmc.reload")) {
                     sender.sendMessage(msg("permission.reload"));
-                    return true;
+                    return;
                 }
                 java.nio.file.Path importDir = plugin.getDownloadManager().getImportDirectory();
-                plugin.getServer().getScheduler().runTaskAsynchronously(plugin, () -> {
+                String requestedFile = rest.length == 0 ? null : String.join(" ", rest);
+                runBackground(sender, () -> {
                     java.util.List<java.nio.file.Path> files;
                     try {
-                        // Created at startup, but be defensive if it was deleted
-                        java.nio.file.Files.createDirectories(importDir);
-                        try (var stream = java.nio.file.Files.list(importDir)) {
-                            files = stream
-                                    .filter(java.nio.file.Files::isRegularFile)
-                                    .filter(f -> f.getFileName().toString()
-                                            .toLowerCase(Locale.ROOT).endsWith(".nbs"))
-                                    .sorted()
-                                    .toList();
-                        }
+                        files = plugin.getDownloadManager().findImportFiles(requestedFile);
                     } catch (java.io.IOException e) {
-                        plugin.getServer().getScheduler().runTask(plugin, () ->
+                        plugin.runMain(() ->
                                 sender.sendMessage(msg("import.error",
                                         Placeholder.unparsed("error", String.valueOf(e.getMessage())))));
                         return;
                     }
 
                     if (files.isEmpty()) {
-                        plugin.getServer().getScheduler().runTask(plugin, () ->
+                        plugin.runMain(() ->
                                 sender.sendMessage(msg("import.empty",
                                         Placeholder.unparsed("path", importDir.toString()))));
                         return;
@@ -343,21 +373,20 @@ public class SongsCommand implements CommandExecutor, TabCompleter {
                     for (java.nio.file.Path file : files) {
                         try {
                             String id = plugin.getDownloadManager().importLocal(file);
-                            java.nio.file.Files.deleteIfExists(file);   // consumed
                             tally[0]++;
-                            plugin.getServer().getScheduler().runTask(plugin, () ->
+                            plugin.runMain(() ->
                                     sender.sendMessage(msg("import.one",
                                             Placeholder.unparsed("title",
                                                     plugin.getDownloadManager().getTitle(id)))));
                         } catch (Exception e) {
                             tally[1]++;
-                            plugin.getServer().getScheduler().runTask(plugin, () ->
+                            plugin.runMain(() ->
                                     sender.sendMessage(msg("import.failed",
                                             Placeholder.unparsed("file", file.getFileName().toString()),
                                             Placeholder.unparsed("error", String.valueOf(e.getMessage())))));
                         }
                     }
-                    plugin.getServer().getScheduler().runTask(plugin, () ->
+                    plugin.runMain(() ->
                             sender.sendMessage(msg("import.done",
                                     Placeholder.unparsed("count", String.valueOf(tally[0])),
                                     Placeholder.unparsed("failed", String.valueOf(tally[1])))));
@@ -366,12 +395,12 @@ public class SongsCommand implements CommandExecutor, TabCompleter {
             case "importurl" -> {
                 if (!sender.hasPermission("noteblockworldmc.importurl")) {
                     sender.sendMessage(msg("permission.importurl"));
-                    return true;
+                    return;
                 }
                 if (rest.length < 1) {
                     sender.sendMessage(msg("usage.importurl",
                             Placeholder.unparsed("label", label)));
-                    return true;
+                    return;
                 }
                 String url = rest[0];
                 // Everything after the URL is an optional name to register under
@@ -380,15 +409,15 @@ public class SongsCommand implements CommandExecutor, TabCompleter {
                         : null;
                 sender.sendMessage(msg("importurl.fetching",
                         Placeholder.unparsed("url", url)));
-                plugin.getServer().getScheduler().runTaskAsynchronously(plugin, () -> {
+                runBackground(sender, () -> {
                     try {
                         String id = plugin.getDownloadManager().importUrl(url, overrideName);
-                        plugin.getServer().getScheduler().runTask(plugin, () ->
+                        plugin.runMain(() ->
                                 sender.sendMessage(msg("importurl.done",
                                         Placeholder.unparsed("title",
                                                 plugin.getDownloadManager().getTitle(id)))));
                     } catch (Exception e) {
-                        plugin.getServer().getScheduler().runTask(plugin, () ->
+                        plugin.runMain(() ->
                                 sender.sendMessage(msg("importurl.failed",
                                         Placeholder.unparsed("error",
                                                 String.valueOf(e.getMessage())))));
@@ -398,11 +427,11 @@ public class SongsCommand implements CommandExecutor, TabCompleter {
             case "analyze" -> {
                 if (!(sender instanceof org.bukkit.entity.Player player)) {
                     sender.sendMessage(msg("general.players-only-analyze"));
-                    return true;
+                    return;
                 }
                 if (!sender.hasPermission("noteblockworldmc.play")) {
                     sender.sendMessage(msg("permission.play"));
-                    return true;
+                    return;
                 }
                 String songId;
                 if (rest.length == 0) {
@@ -411,19 +440,19 @@ public class SongsCommand implements CommandExecutor, TabCompleter {
                             .currentSongIdFor(player.getUniqueId());
                     if (songId == null) {
                         sender.sendMessage(msg("analyze.nothing-playing"));
-                        return true;
+                        return;
                     }
                 } else {
                     songId = resolveSong(sender, rest);
-                    if (songId == null) return true;
+                    if (songId == null) return;
                 }
 
                 plugin.getPlaybackManager().inspect(songId, player, song ->
                         // The sweep sorts every note twice; keep it off the main thread
-                        plugin.getServer().getScheduler().runTaskAsynchronously(plugin, () -> {
+                        runBackground(sender, () -> {
                             var report = io.github.noteblockworldmc.playback.PolyphonyAnalyzer
-                                    .analyze(plugin, song, songId);
-                            plugin.getServer().getScheduler().runTask(plugin, () -> {
+                                    .analyze(plugin, song, songId, player.getUniqueId());
+                            plugin.runMain(() -> {
                                 if (player.isOnline()) sendAnalysis(player, report);
                             });
                         }));
@@ -431,15 +460,18 @@ public class SongsCommand implements CommandExecutor, TabCompleter {
             case "packinfo" -> {
                 if (!sender.hasPermission("noteblockworldmc.reload")) {
                     sender.sendMessage(msg("permission.reload"));
-                    return true;
+                    return;
                 }
                 var pack = plugin.getResourcePackService();
                 sender.sendMessage(net.kyori.adventure.text.Component.text(
                         "Pack enabled=" + pack.isEnabled()
                         + " active=" + pack.isActive()
+                        + " bound=" + pack.getBoundAddress()
                         + " url=" + (pack.getPublicUrl().isBlank() ? "(unset)" : pack.getPublicUrl())
+                        + " download=" + pack.getDownloadUrl()
                         + " size=" + pack.getPackSize() + "B"
                         + " events=" + pack.getEventCount()
+                        + " format=" + pack.getPackFormat()
                         + " sha1=" + pack.getPackSha1()));
                 if (sender instanceof org.bukkit.entity.Player player) {
                     sender.sendMessage(net.kyori.adventure.text.Component.text(
@@ -450,12 +482,12 @@ public class SongsCommand implements CommandExecutor, TabCompleter {
             case "playing" -> {
                 if (!sender.hasPermission("noteblockworldmc.broadcast")) {
                     sender.sendMessage(msg("permission.broadcast"));
-                    return true;
+                    return;
                 }
                 var active = plugin.getPlaybackManager().activeSongs();
                 if (active.isEmpty()) {
                     sender.sendMessage(msg("playing.none"));
-                    return true;
+                    return;
                 }
                 sender.sendMessage(msg("playing.header",
                         Placeholder.unparsed("count", String.valueOf(active.size()))));
@@ -472,7 +504,7 @@ public class SongsCommand implements CommandExecutor, TabCompleter {
             case "config" -> {
                 if (!sender.hasPermission("noteblockworldmc.config")) {
                     sender.sendMessage(msg("permission.config"));
-                    return true;
+                    return;
                 }
                 if (rest.length == 0) {
                     listConfig(sender, label);
@@ -492,22 +524,28 @@ public class SongsCommand implements CommandExecutor, TabCompleter {
             case "reload" -> {
                 if (!sender.hasPermission("noteblockworldmc.reload")) {
                     sender.sendMessage(msg("permission.reload"));
-                    return true;
+                    return;
                 }
-                plugin.reloadConfig();
-                plugin.getMessages().reload();
-                plugin.getPlaybackManager().loadHotSettings();
-                plugin.getResourcePackService().loadHotSettings();
-                // The category cache has no expiry, so reload is the one place
-                // an admin can force it to be re-read.
-                plugin.getApiClient().refreshCategories();
-                sender.sendMessage(msg("general.reloaded"));
-                sender.sendMessage(msg("general.reload-note"));
+                try {
+                    plugin.reloadSettings(true).whenComplete((unused, error) -> plugin.runMain(() -> {
+                        if (error != null) {
+                            sender.sendMessage(msg("general.reload-failed",
+                                    Placeholder.unparsed("reason", Throwables.describe(error))));
+                            plugin.getLogger().warning("Reload failed: " + error);
+                        } else {
+                            sender.sendMessage(msg("general.reloaded"));
+                            sender.sendMessage(msg("general.reload-note"));
+                        }
+                    }));
+                } catch (RuntimeException e) {
+                    sender.sendMessage(msg("general.reload-failed",
+                            Placeholder.unparsed("reason", Throwables.describe(e))));
+                    plugin.getLogger().warning("Reload failed: " + e);
+                }
             }
             case "help" -> sendUsage(sender, label);
             default -> sendUsage(sender, label);
         }
-        return true;
     }
 
     // ------------------------------------------------------------------
@@ -519,13 +557,15 @@ public class SongsCommand implements CommandExecutor, TabCompleter {
 
         plugin.getApiClient().fetchCategories()
                 .whenComplete((categories, throwable) ->
-                        Bukkit.getScheduler().runTask(plugin, () -> {
-                            if (throwable != null) {
-                                handleError(sender, throwable);
+                        plugin.runMain(() -> {
+                            if (throwable != null || categories == null) {
+                                handleError(sender, throwable != null ? throwable
+                                        : new IllegalStateException("noteblock.world returned no categories"));
                                 return;
                             }
                             sender.sendMessage(msg("categories.header"));
                             for (Map.Entry<String, Integer> entry : categories.entrySet()) {
+                                if (entry.getKey() == null) continue;
                                 // Clicking a category lists it directly
                                 sender.sendMessage(msg("categories.entry",
                                         Placeholder.unparsed("name", entry.getKey()),
@@ -574,6 +614,8 @@ public class SongsCommand implements CommandExecutor, TabCompleter {
 
     private void sendAnalysis(org.bukkit.entity.Player player,
             io.github.noteblockworldmc.playback.PolyphonyAnalyzer.Report report) {
+        player.sendMessage(net.kyori.adventure.text.Component.text(
+                "Excluded inaudible/unavailable notes: " + report.excludedNotes()));
         player.sendMessage(msg("analyze.header",
                 Placeholder.unparsed("title", report.title())));
         player.sendMessage(msg("analyze.notes",
@@ -658,15 +700,6 @@ public class SongsCommand implements CommandExecutor, TabCompleter {
     }
 
     /**
-     * Lists only the commands this sender can actually run.
-     *
-     * Every line is gated on the permission guarding its own command, rather
-     * than split into fixed "player" and "admin" blocks. On a server where
-     * everything but volume is op-only — the intended setup — an ordinary
-     * player sees just the volume line instead of a menu of commands that
-     * would only answer with a permission error.
-     */
-    /**
      * A parsed /nbw play target: who the song should play for, and the song
      * arguments with any leading target token removed.
      *
@@ -708,24 +741,24 @@ public class SongsCommand implements CommandExecutor, TabCompleter {
     }
 
     private void playResolved(org.bukkit.entity.Player caller, PlayTarget target, String publicId) {
-        if (target.everyone()) {
-            plugin.getPlaybackManager().playDownloadedForAll(caller, publicId);
-        } else if (target.single() != null) {
-            plugin.getPlaybackManager().playDownloaded(target.single(), publicId);
-            caller.sendMessage(msg("playback.playing-for-target",
-                    Placeholder.unparsed("name", target.single().getName())));
-        } else {
-            plugin.getPlaybackManager().playDownloaded(caller, publicId);
-        }
+        var request = plugin.getPlaybackManager().beginPlay(caller,
+                target.single() == null ? caller : target.single(), target.everyone());
+        playResolved(caller, target, publicId, request);
+    }
+    private void playResolved(org.bukkit.entity.Player caller, PlayTarget target, String publicId,
+                              io.github.noteblockworldmc.playback.PlaybackManager.PlayRequest request) {
+        plugin.getPlaybackManager().playDownloaded(request, caller, publicId);
+        if (target.single() != null) caller.sendMessage(msg("playback.playing-for-target",
+                Placeholder.unparsed("name", target.single().getName())));
     }
 
     /**
      * Lists the settings that can be changed in game.
      *
-     * Only values the plugin re-reads at runtime appear here. Anything consumed
-     * once at startup (the pack port, the API base URL, the HTTP timeouts) is
-     * absent by design: offering it would let an admin change a number and see
-     * nothing happen.
+     * The editor exposes playback controls because they are useful to tune from
+     * in-game. Other settings stay in config.yml and are applied by /nbw reload;
+     * that includes the API endpoint, HTTP timeouts, download limits, and pack
+     * server address.
      */
     private void listConfig(CommandSender sender, String label) {
         var options = ConfigEditor.options();
@@ -804,14 +837,23 @@ public class SongsCommand implements CommandExecutor, TabCompleter {
             return;
         }
 
-        // Re-read from disk and re-apply, so the change is live immediately
-        // rather than waiting for a separate /nbw reload. Both managers are
-        // refreshed even though only playback settings are editable today: it
-        // costs a handful of field assignments and stays correct if the
-        // editable set ever widens.
-        plugin.reloadConfig();
-        plugin.getPlaybackManager().loadHotSettings();
-        plugin.getResourcePackService().loadHotSettings();
+        try {
+            plugin.reloadSettings(false);
+        } catch (RuntimeException e) {
+            // Put the line back: otherwise config.yml holds a value that is
+            // not in effect, and the next restart or reload applies it
+            // without anyone having seen it work.
+            try {
+                ConfigEditor.write(plugin.getDataFolder().toPath().resolve("config.yml"), option, previous);
+            } catch (java.io.IOException restore) {
+                e.addSuppressed(restore);
+                plugin.getLogger().warning("Could not restore " + option.path() + " in config.yml: " + restore);
+            }
+            sender.sendMessage(msg("config.apply-failed",
+                    Placeholder.unparsed("setting", option.shortName()),
+                    Placeholder.unparsed("reason", Throwables.describe(e))));
+            return;
+        }
 
         sender.sendMessage(msg("config.set",
                 Placeholder.unparsed("setting", option.shortName()),
@@ -889,13 +931,41 @@ public class SongsCommand implements CommandExecutor, TabCompleter {
 
     // ------------------------------------------------------------------
 
-    @Override
-    public List<String> onTabComplete(CommandSender sender, Command command, String alias, String[] args) {
+    /** Subcommands with the permission their completions need ("" = anyone). */
+    private static final String[][] SUBCOMMANDS = {
+            {"search", "noteblockworldmc.browse"}, {"download", "noteblockworldmc.download"},
+            {"play", "noteblockworldmc.play"}, {"stop", ""}, {"playing", "noteblockworldmc.broadcast"},
+            {"volume", "noteblockworldmc.volume"}, {"remove", "noteblockworldmc.remove"},
+            {"categories", "noteblockworldmc.browse"}, {"analyze", "noteblockworldmc.play"},
+            {"import", "noteblockworldmc.reload"}, {"importurl", "noteblockworldmc.importurl"},
+            {"packinfo", "noteblockworldmc.reload"}, {"config", "noteblockworldmc.config"},
+            {"reload", "noteblockworldmc.reload"}, {"help", ""},
+    };
+
+    /** Completes the token being typed; {@code args} always holds at least that token. */
+    public List<String> complete(CommandSender sender, String[] args) {
+        if (args.length == 0) return List.of();
         if (args.length == 1) {
-            return filterPrefix(Arrays.asList("search", "download", "play", "stop", "playing", "volume", "remove", "categories", "analyze", "import", "importurl", "packinfo", "config", "reload", "help"), args[0]);
+            return filterPrefix(Arrays.stream(SUBCOMMANDS)
+                    .filter(entry -> entry[1].isEmpty() || sender.hasPermission(entry[1]))
+                    .map(entry -> entry[0]).toList(), args[0]);
         }
 
         String sub = args[0].toLowerCase(Locale.ROOT);
+        // Suggestions are shown to everyone who can see /nbw, so they must not
+        // reveal the library or current settings to players who could not
+        // run that subcommand anyway.
+        String needed = Arrays.stream(SUBCOMMANDS).filter(entry -> entry[0].equals(sub))
+                .map(entry -> entry[1]).findFirst().orElse(null);
+        if (needed == null || (!needed.isEmpty() && !sender.hasPermission(needed))) return List.of();
+        if (sub.equals("import") && sender.hasPermission("noteblockworldmc.reload")) {
+            try {
+                return filterPrefix(plugin.getDownloadManager().findImportFiles(null).stream()
+                        .map(path -> path.getFileName().toString()).toList(), args[args.length - 1]);
+            } catch (java.io.IOException e) {
+                return List.of();
+            }
+        }
         // /nbw config <setting> <value>
         if (sub.equals("config") && args.length == 2) {
             return filterPrefix(ConfigEditor.names(), args[1]);
@@ -917,9 +987,13 @@ public class SongsCommand implements CommandExecutor, TabCompleter {
         // First argument of play/stop can be a target: online players + @a.
         if ((sub.equals("play") || sub.equals("stop")) && args.length == 2) {
             java.util.List<String> targets = new java.util.ArrayList<>();
-            targets.add("@a");
-            for (org.bukkit.entity.Player online : Bukkit.getOnlinePlayers()) {
-                targets.add(online.getName());
+            // Targets are an admin action; offering them to everyone only
+            // invited a permission error.
+            if (sender.hasPermission("noteblockworldmc.broadcast")) {
+                targets.add("@a");
+                for (org.bukkit.entity.Player online : Bukkit.getOnlinePlayers()) {
+                    targets.add(online.getName());
+                }
             }
             // play also completes song titles here (no target given yet), so
             // merge both; stop takes only a target.

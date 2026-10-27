@@ -1,10 +1,10 @@
 # NoteblockWorldMC configuration.
 #
-# Most settings apply as soon as you run /nbw reload. The exceptions say so
-# in their own comment: resource-pack.port and resource-pack.bind-address
-# need a full server restart, because the pack server's socket is bound to
-# them. The playback.* settings can also be changed in game with
-# /nbw config, which writes the value here and applies it immediately.
+# /nbw reload applies API settings, download limits, playback, and pack settings.
+# Pack port/bind-address changes restart its HTTP server and may interrupt an
+# active pack transfer; online players receive another push. Pack builds are
+# asynchronous, including reloads that pick up audio files supplied by hand.
+# /nbw config changes playback settings immediately and writes them here.
 
 # Base URL of the Note Block World API.
 # The backend serves its routes under the /v1 prefix.
@@ -16,7 +16,7 @@ http:
   connect-timeout: 10
   request-timeout: 15
 
-# Download limits (packed song zips; .nbs files are capped at 3 MB by the API)
+# Size limits for catalog ZIP downloads and imported NBS files
 download:
   max-zip-size-mb: 32
   max-extracted-size-mb: 64
@@ -32,8 +32,25 @@ gui:
   # /nbw volume and is never cut by a fade or /nbw stop.
   click-sound: true
 
-# Server resource pack (extended octaves; custom instruments in a later phase)
+# Server resource pack: extended octaves and custom instruments
 resource-pack:
+  # Try to supply an IMPORTED song's custom instruments from Minecraft itself.
+  #
+  # A .nbs file names its custom instruments but cannot contain them, so a
+  # song imported with /nbw import or /nbw importurl arrives with the names
+  # and no audio, and those notes are silent. Songs downloaded from
+  # noteblock.world are unaffected -- they ship a zip containing the sounds.
+  #
+  # With this on, each missing sound is looked up in Mojang's asset index and
+  # fetched if it names a real Minecraft sound. That covers most cases,
+  # because noteblock.world only accepts Minecraft sounds as custom
+  # instruments in the first place. A genuinely custom recording cannot be
+  # recovered by any means; those are named in the console so you can drop the
+  # .ogg files into the song's sounds/ folder yourself.
+  #
+  # Off by default because it downloads from Mojang's CDN during an import.
+  recover-vanilla-custom-sounds: false
+
   # Master switch for the extended octave range and custom instruments.
   # Requires public-url below to be set. Changing this takes effect on
   # /nbw reload -- the pack server starts or stops without a restart.
@@ -41,15 +58,19 @@ resource-pack:
   # Resource pack format to declare, which must match the Minecraft version
   # your players connect with, or their client marks the pack red and
   # "incompatible" in the resource pack screen.
-  #   84 = 26.1 - 26.1.2      88 = 26.2
-  # A player can check their own with F3+V. Only bump this when you move the
-  # server to a newer Minecraft version -- a mismatch is what makes the pack
-  # show up red and "incompatible" in the client's resource pack screen.
-  pack-format: 88
+  #
+  # auto (default) follows this server's own Minecraft version:
+  #   84 = 26.1 - 26.1.2      88 = 26.2      97 = 26.3 (reported as 97.1)
+  # On a version newer than this plugin build knows, auto uses 97 and logs a
+  # warning. Set a number instead only when players join with a different
+  # client version than the server (for example through ViaVersion); a player
+  # can check their own with F3+V. A number that does not match the server's
+  # version is reported in the console at startup and on /nbw reload.
+  pack-format: auto
 
   # Port for the built-in pack HTTP server (open it in your firewall).
-  # Needs a server restart to change: the socket is already bound to it, and
-  # re-binding mid-session would drop pack downloads in progress.
+  # Applied on /nbw reload by restarting the pack HTTP server. Active pack
+  # transfers may be interrupted; clients are sent a fresh pack request.
   port: 8194
   # URL your PLAYERS' clients fetch the pack from, e.g.
   # "http://your-server-ip:8194/pack.zip". Must be reachable from outside this
@@ -68,14 +89,21 @@ resource-pack:
   # Interface to bind. 0.0.0.0 accepts direct connections. Set 127.0.0.1 to
   # expose it only to a reverse proxy (nginx/Caddy), then point public-url at
   # the proxy's https:// address -- the tidiest setup if you already run one.
-  # Needs a server restart to change, for the same reason as the port above.
+  # Applied on /nbw reload, with the same transfer interruption as a port change.
   bind-address: "0.0.0.0"
   # Abuse limits for the pack server. The pack is several megabytes, so a
   # flood could starve real players of their download (and with
-  # kick-on-refuse, get them disconnected). 0 disables the rate limit.
+  # kick-on-refuse, get them disconnected). The rate limit counts each IPv4
+  # address or IPv6 /64 separately; 0 disables it. Online players' addresses
+  # may use every download slot, while other addresses share at most half
+  # of them (a quarter each), so strangers cannot crowd out joining players.
+  # Requests from this machine or a private network (a reverse proxy, a
+  # container port-forwarder, a LAN) are exempt from both, since there one
+  # address can stand for every player -- configure limits in the proxy.
   rate-limit-per-minute: 30
   max-concurrent-downloads: 16
-  # Kick players who decline the pack or whose download fails
+  # Require the initial join-time pack and kick if it is refused or fails.
+  # Later pushes are optional and failures resolve to fallback playback.
   kick-on-refuse: true
   # Download the vanilla note block sounds from Mojang's asset CDN (once,
   # cached in vanilla-sounds/). Required for extended octaves on vanilla
@@ -146,13 +174,20 @@ playback:
   # values act sooner and flatten dynamics; higher values leave more headroom.
   # Ignored entirely when soft-limiter is false. Minimum 2.
   limiter-threshold: 8
+
+  # Minimum effective volume sent for a note. NBS velocity and layer volume
+  # are multiplied before this check. 0 keeps every nonzero note eligible;
+  # raise it on a busy server to avoid spending client channels on sounds that
+  # are too quiet to hear. The parser still discards truly silent (zero-volume)
+  # notes. Range 0.0-1.0.
+  audible-floor: 0.0
+
   # Milliseconds spent ramping down when a song stops (0 = cut instantly).
   #
   # Notes struck during the ramp get progressively quieter, and once it ends
   # the notes still ringing are left to decay naturally instead of being cut
-  # -- so the music tails off rather than stopping dead. Sound can therefore
-  # continue for up to about a second after the ramp finishes, which is what
-  # a fade is. Press stop twice for an immediate cut.
+  # -- so the music tails off rather than stopping dead. The remaining tail
+  # depends on the samples in the song. Press stop twice for an immediate cut.
   #
   # This also applies when SWITCHING songs: the outgoing song ramps down and
   # the new one starts as that ramp completes, with the old tail decaying
@@ -204,7 +239,8 @@ playback:
   # Set humanize: false for the exact, quantised timing that Note Block
   # Studio and every other NBS player produce.
   humanize: true
-  # Each note lands within +/- this many milliseconds of its true time
+  # Base timing spread in milliseconds. Chord drift can reach twice this;
+  # a positive scheduling offset is added, giving delays up to 3x the spread.
   humanize-timing-ms: 6
   # Random volume variation per note (0.04 = +/-4%)
   humanize-velocity: 0.04
@@ -220,25 +256,32 @@ playback:
 
   # Attach each note to the listener instead of placing it in the world.
   #
-  # false (default) - notes are placed at your position. Stereo panning works,
+  # false           - notes are placed at your position. Stereo panning works,
   #                   but a note keeps ringing WHERE IT WAS PLAYED, so moving
   #                   away from it changes its volume and direction. Fine if
   #                   listeners stand still; audible as fading/stuttering if
   #                   they walk, sprint or fly.
-  # true            - notes travel with you: constant volume however you move.
+  # true (default)  - notes travel with you: constant volume however you move.
   #                   Minecraft cannot pan an attached sound, so stereo-panning
   #                   below is ignored.
   #
   # Hot-reloadable, so you can flip it mid-song with /nbw reload and compare.
   follow-player: true
 
-  # Reproduce each note's stereo panning by emitting it slightly to the
-  # listener's left/right. Minecraft has no pan parameter, so this is done
-  # positionally. Requires follow-player: false, since an attached sound has
-  # no world position to offset.
+  # Reproduce each note's stereo panning. Minecraft has no pan parameter: the
+  # client pans a sound by the DIRECTION it comes from, so each panned note is
+  # placed at the matching angle around the listener's view (a 30% left note
+  # sits about 17 degrees left of centre). Requires follow-player: false,
+  # since an attached sound has no position of its own to offset.
+  #
+  # Notes are placed where the listener will be when the sound arrives
+  # (their movement times the time since the last tick plus their ping), so
+  # walking, sprinting and flying no longer leave every note behind them.
+  # A note still cannot move once it has started, so very long notes can
+  # drift a little during fast movement.
   stereo-panning: true
-  # How far (in blocks) a fully-panned note is offset from the listener.
-  # Larger values widen the stereo image but push sounds far enough away that
-  # Minecraft's distance attenuation starts making them quieter. Ignored when
-  # stereo-panning is false.
+  # Distance (in blocks) at which panned notes are placed. The pan amount
+  # comes from the angle, not this distance; volume is compensated for it.
+  # Larger values make panning steadier while moving, at the cost of a little
+  # more spread. Ignored when stereo-panning is false.
   pan-distance: 2.0

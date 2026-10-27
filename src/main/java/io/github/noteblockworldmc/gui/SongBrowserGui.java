@@ -45,14 +45,17 @@ import java.util.HashMap;
  *   0-35   songs (4 rows, 36 per page = one API request per GUI page)
  *   36-44  divider
  *   45     prev page       46 page info      47 next page (or reroll for random)
- *   49     sort selector   50 order toggle   51 category selector
- *   52     refresh         53 close
+ *   48     search          49 sort selector  50 order toggle
+ *   51     category        52 filler         53 stop
  *
  * The GUI owns a SongQuery; every control click derives a new query
  * (via toBuilder/withPage) and refetches. All Bukkit interaction happens
  * on the main thread; only the HTTP call is async.
  */
 public class SongBrowserGui implements InventoryHolder {
+
+    /** Separate gate key so page and category lookups can share one owner safely. */
+    private record GateKey(java.util.UUID player, String operation) {}
 
     public static final int SONG_SLOTS = 36;
 
@@ -92,6 +95,8 @@ public class SongBrowserGui implements InventoryHolder {
 
     private SongQuery query;
     private SongPage currentPage;
+    private boolean songsActionable;
+    public boolean isOwner(java.util.UUID id) { return player.getUniqueId().equals(id); }
 
     /** Categories cache: null while loading, then names in a stable order. */
     private List<String> categories;
@@ -164,7 +169,7 @@ public class SongBrowserGui implements InventoryHolder {
 
     /** True when this song slot is actually filled on the current page. */
     private boolean hasSongAt(int slot) {
-        return currentPage != null && slot < currentPage.getContent().size();
+        return songsActionable && currentPage != null && slot >= 0 && slot < currentPage.getContent().size();
     }
 
     /**
@@ -172,9 +177,9 @@ public class SongBrowserGui implements InventoryHolder {
      *
      * Deliberately NOT in SoundCategory.RECORDS. That is the category note
      * playback uses and the one stopSound clears, so a UI blip there would be
-     * silenced by a fade or /nbw stop, would be scaled by the player's music
-     * volume, and would occupy one of the client's note channels. MASTER keeps
-     * it independent of all three.
+     * silenced by a hard stop in that category. MASTER keeps the click outside
+     * the music category; it is also sent without personal-volume scaling.
+     * All categories still share the client's sound-channel pool.
      *
      * Read from config on each click rather than cached, so toggling it takes
      * effect immediately with no reload wiring.
@@ -228,13 +233,15 @@ public class SongBrowserGui implements InventoryHolder {
         }
 
         // Throttle the control row: every one of these clicks can trigger an
-        // API request, and click-spam would hammer the service. Placed before
-        // any state mutation so e.g. the category index can never advance
-        // without its matching fetch.
-        if (controlClickThrottled()) return;
-        // After the throttle, so a click that was dropped stays silent rather
-        // than sounding like it worked.
-        if (CONTROL_SLOTS.contains(slot)) playClickSound();
+        // API request, and click-spam would hammer the service. Decorative
+        // filler is deliberately outside the gate, so touching it cannot
+        // suppress a real control click immediately afterwards.
+        if (CONTROL_SLOTS.contains(slot)) {
+            if (controlClickThrottled()) return;
+            // After the throttle, so a click that was dropped stays silent
+            // rather than sounding like it worked.
+            playClickSound();
+        }
 
         switch (slot) {
             case SLOT_PREV -> {
@@ -294,7 +301,7 @@ public class SongBrowserGui implements InventoryHolder {
      * description page, wrapping back to the first after the last.
      */
     private void cycleDescriptionPage(int slot) {
-        if (currentPage == null || slot >= currentPage.getContent().size()) return;
+        if (!hasSongAt(slot)) return;
         SongPreview song = currentPage.getContent().get(slot);
 
         int totalPages = descriptionPageCount(song);
@@ -306,6 +313,30 @@ public class SongBrowserGui implements InventoryHolder {
         inventory.setItem(slot, songItem(song, next));
     }
 
+    /** Most description lines one right-click prints; the tooltip pages through the rest. */
+    static final int DETAILS_MAX_LINES = 30;
+
+    /**
+     * The description as ONE chat message of at most {@link #DETAILS_MAX_LINES}
+     * lines. Sending a message per line let an uploaded description of a few
+     * thousand newlines turn every right-click into thousands of packets.
+     */
+    private Component descriptionMessage(String desc) {
+        List<Component> lines = new ArrayList<>();
+        boolean blank = false;
+        for (String line : desc.split("\n")) {
+            if (line.isBlank()) { if (blank || lines.isEmpty()) continue; blank = true; } else blank = false;
+            if (lines.size() == DETAILS_MAX_LINES) {
+                lines.add(msg("details.description-line", Placeholder.unparsed("line", "…")));
+                break;
+            }
+            lines.add(msg("details.description-line", Placeholder.unparsed("line", line)));
+        }
+        Component message = Component.empty();
+        for (int i = 0; i < lines.size(); i++) message = (i == 0 ? message : message.append(Component.newline())).append(lines.get(i));
+        return message;
+    }
+
     private static int descriptionPageCount(SongPreview song) {
         String desc = song.getDescription();
         if (desc == null || desc.isBlank()) return 1;
@@ -314,7 +345,7 @@ public class SongBrowserGui implements InventoryHolder {
     }
 
     private void handleSongClick(int slot, ClickType click) {
-        if (currentPage == null || slot >= currentPage.getContent().size()) return;
+        if (!hasSongAt(slot)) return;
         SongPreview song = currentPage.getContent().get(slot);
 
         if (click == ClickType.SHIFT_RIGHT
@@ -335,12 +366,7 @@ public class SongBrowserGui implements InventoryHolder {
                     Placeholder.unparsed("plays", String.valueOf(song.getPlayCount())),
                     Placeholder.unparsed("id", song.getPublicId())));
             String desc = song.getDescription();
-            if (desc != null && !desc.isBlank()) {
-                for (String line : desc.split("\n")) {
-                    player.sendMessage(msg("details.description-line",
-                            Placeholder.unparsed("line", line)));
-                }
-            }
+            if (desc != null && !desc.isBlank()) player.sendMessage(descriptionMessage(desc));
             return;
         }
 
@@ -350,7 +376,7 @@ public class SongBrowserGui implements InventoryHolder {
             player.sendMessage(msg("permission.broadcast"));
             return;
         }
-        if (!broadcast && !player.hasPermission("noteblockworldmc.play")) {
+        if (!player.hasPermission("noteblockworldmc.play")) {
             player.sendMessage(msg("permission.play"));
             return;
         }
@@ -367,24 +393,24 @@ public class SongBrowserGui implements InventoryHolder {
             player.sendMessage(msg("permission.download"));
             return;
         }
-        if (downloads.isInFlight(id)) {
-            player.sendMessage(msg("download.in-progress"));
-            return;
-        }
+        // A download already under way (from this or another player) is
+        // joined, so this click still plays the song when it lands.
+        player.sendMessage(downloads.isInFlight(id) ? msg("download.in-progress")
+                : msg("download.downloading", Placeholder.unparsed("song", song.getTitle())));
 
-        player.sendMessage(msg("download.downloading",
-                Placeholder.unparsed("song", song.getTitle())));
-
+        var playRequest = plugin.getPlaybackManager().beginPlay(player, player, broadcast);
         downloads.download(id, song).whenComplete((path, throwable) ->
-                Bukkit.getScheduler().runTask(plugin, () -> {
-                    if (!player.isOnline()) return;
+                plugin.runMain(() -> {
                     if (throwable != null) {
-                        player.sendMessage(msg("download.failed",
+                        plugin.getPlaybackManager().abandon(playRequest);
+                        if (player.isOnline()) player.sendMessage(msg("download.failed",
                                 Placeholder.unparsed("reason", Throwables.describe(throwable))));
                         return;
                     }
+                    if (!player.isOnline()) return;
                     refreshSongItem(id);
-                    startPlayback(id, broadcast);
+                    if (plugin.getPlaybackManager().isCurrent(playRequest))
+                        plugin.getPlaybackManager().playDownloaded(playRequest, player, id);
                 }));
     }
 
@@ -453,8 +479,7 @@ public class SongBrowserGui implements InventoryHolder {
             // this stopped only the broadcast, and hard-cut it, so the same
             // intent produced different results depending on which one you
             // used.
-            boolean any = playback.stopBroadcastFading();
-            any |= playback.stopAllPersonalFading();
+            boolean any = playback.stopEveryoneFading();
             player.sendMessage(any ? msg("playback.stopped-everyone")
                                    : msg("playback.nothing-playing-anywhere"));
             return;
@@ -467,7 +492,7 @@ public class SongBrowserGui implements InventoryHolder {
 
     /** Re-renders a single song item (e.g. to add the downloaded marker). */
     private void refreshSongItem(String publicId) {
-        if (!isStillViewing() || currentPage == null) return;
+        if (!isStillViewing() || !songsActionable || currentPage == null) return;
         List<SongPreview> songs = currentPage.getContent();
         for (int i = 0; i < songs.size(); i++) {
             if (songs.get(i).getPublicId().equals(publicId)) {
@@ -514,9 +539,10 @@ public class SongBrowserGui implements InventoryHolder {
         // until the player closes and reopens it. Cheap to rule out.
         CompletableFuture<SongPage> future;
         try {
-            future = query.isDownloadedOnly()
-                    ? plugin.getDownloadManager().queryLocal(query)
-                    : plugin.getApiClient().fetchSongs(query);
+            SongQuery requestedQuery = query;
+            future = plugin.getBrowserGate().submit(player.getUniqueId(), () -> requestedQuery.isDownloadedOnly()
+                    ? plugin.getDownloadManager().queryLocal(requestedQuery)
+                    : plugin.getApiClient().fetchSongs(requestedQuery));
         } catch (RuntimeException e) {
             fetchInFlight = false;
             refetchWanted = false;
@@ -525,7 +551,7 @@ public class SongBrowserGui implements InventoryHolder {
         }
 
         future.whenComplete((page, throwable) ->
-                        Bukkit.getScheduler().runTask(plugin, () -> {
+                        plugin.runMain(() -> {
                             fetchInFlight = false;
                             boolean queued = refetchWanted;
                             refetchWanted = false;
@@ -535,7 +561,7 @@ public class SongBrowserGui implements InventoryHolder {
                                 return;
                             }
                             if (id != requestId || !isStillViewing()) return;
-                            if (throwable != null) {
+                            if (throwable != null || page == null) {
                                 renderError();
                                 return;
                             }
@@ -545,9 +571,20 @@ public class SongBrowserGui implements InventoryHolder {
     }
 
     private void prefetchCategories() {
-        plugin.getApiClient().fetchCategories()
+        // Category prefetch is another API request. Route it through the
+        // plugin-wide gate as well, so repeatedly opening short-lived browser
+        // instances cannot bypass the per-player admission window while a
+        // previous category lookup is still running.
+        CompletableFuture<Map<String, Integer>> request;
+        try {
+            request = plugin.getBrowserGate().submit(new GateKey(player.getUniqueId(), "categories"),
+                    () -> plugin.getApiClient().fetchCategories());
+        } catch (RuntimeException e) {
+            return;
+        }
+        request
                 .whenComplete((cats, throwable) ->
-                        Bukkit.getScheduler().runTask(plugin, () -> {
+                        plugin.runMain(() -> {
                             if (throwable != null || cats == null) return;
                             this.categories = new ArrayList<>();
                             for (Map.Entry<String, Integer> e : cats.entrySet()) {
@@ -565,7 +602,13 @@ public class SongBrowserGui implements InventoryHolder {
     }
 
     private void cycleCategory(int direction) {
-        if (categories == null || categories.isEmpty()) return; // still loading
+        if (categories == null) {
+            // The first lookup may have failed or been throttled; without a
+            // retry the button stayed on "Loading categories..." for good.
+            prefetchCategories();
+            return;
+        }
+        if (categories.isEmpty()) return;
 
         // Cycle through: all (-1), cat 0, cat 1, ..., back to all
         int span = categories.size() + 1;
@@ -590,6 +633,8 @@ public class SongBrowserGui implements InventoryHolder {
 
     private void render() {
         errorState = false;
+        songsActionable = true;
+        pendingRemoveId = null;
         lorePageBySlot.clear(); // fresh songs -> back to description page 1
 
         // Songs
@@ -606,6 +651,7 @@ public class SongBrowserGui implements InventoryHolder {
     }
 
     private void renderLoading() {
+        songsActionable = false; pendingRemoveId = null;
         errorState = false;
         for (int i = 0; i < SONG_SLOTS; i++) inventory.setItem(i, null);
         inventory.setItem(13, named(Material.CLOCK, itemText("gui.loading"), List.of()));
@@ -613,6 +659,7 @@ public class SongBrowserGui implements InventoryHolder {
     }
 
     private void renderError() {
+        songsActionable = false; pendingRemoveId = null;
         errorState = true;
         for (int i = 0; i < SONG_SLOTS; i++) inventory.setItem(i, null);
         inventory.setItem(13, named(Material.BARRIER,
@@ -662,6 +709,7 @@ public class SongBrowserGui implements InventoryHolder {
     // ------------------------------------------------------------------
 
     private ItemStack songItem(SongPreview song, int lorePage) {
+        if (song == null || !song.hasValidPublicId()) return null;
         Material disc = DISCS[Math.floorMod(song.getPublicId().hashCode(), DISCS.length)];
 
         List<Component> lore = new ArrayList<>();
@@ -842,6 +890,14 @@ public class SongBrowserGui implements InventoryHolder {
     }
 
     /**
+     * One use, and gone after ten minutes. Unused callbacks otherwise live for
+     * Adventure's default 12 hours, each holding a browser and its inventory,
+     * so reopening the dialog repeatedly piled up memory for half a day.
+     */
+    private static final ClickCallback.Options DIALOG_CALLBACK = ClickCallback.Options.builder()
+            .uses(1).lifetime(java.time.Duration.ofMinutes(10)).build();
+
+    /**
      * Opens the search dialog prefilled with {@code prefill}.
      *
      * Buttons: Search (submits), Clear (opens a fresh browser with default
@@ -866,17 +922,17 @@ public class SongBrowserGui implements InventoryHolder {
                         List.of(
                                 ActionButton.builder(msg("dialog.button-search"))
                                         .action(DialogAction.customClick(this::handleSearchDialogSubmit,
-                                                ClickCallback.Options.builder().uses(1).build()))
+                                                DIALOG_CALLBACK))
                                         .build(),
                                 ActionButton.builder(msg("dialog.button-clear"))
                                         .action(DialogAction.customClick((response, audience) ->
-                                                Bukkit.getScheduler().runTask(plugin, () -> {
-                                                    if (player.isOnline()) {
+                                                plugin.runMain(() -> {
+                                                    if (audience == player && player.isOnline() && player.hasPermission("noteblockworldmc.browse")) {
                                                         new SongBrowserGui(plugin, player,
                                                                 SongQuery.builder().build()).open();
                                                     }
                                                 }),
-                                                ClickCallback.Options.builder().uses(1).build()))
+                                                DIALOG_CALLBACK))
                                         .build()),
                         ActionButton.builder(msg("dialog.button-cancel")).build(),
                         2)));
@@ -909,13 +965,15 @@ public class SongBrowserGui implements InventoryHolder {
     }
 
     private void handleSearchDialogSubmit(DialogResponseView response, Audience audience) {
-        String raw = response.getText("query");
+        if (audience != player || plugin.isStopping()) return;
+        String input = response.getText("query");
+        String raw = input == null ? null : input.substring(0, Math.min(200, input.length()));
         String[] tokens = raw == null || raw.isBlank()
                 ? new String[0] : raw.trim().split("\\s+");
 
         // Dialog callbacks may not run on the main thread; hop before Bukkit
-        Bukkit.getScheduler().runTask(plugin, () -> {
-            if (!player.isOnline()) return;
+        plugin.runMain(() -> {
+            if (!player.isOnline() || !player.hasPermission("noteblockworldmc.browse")) return;
             SongQuery parsed = io.github.noteblockworldmc.command.QueryParser
                     .parse(plugin, player, tokens);
             if (parsed == null) return; // parse error already messaged
@@ -959,7 +1017,7 @@ public class SongBrowserGui implements InventoryHolder {
     private static ItemStack named(Material material, Component name, List<Component> lore) {
         ItemStack item = new ItemStack(material);
         ItemMeta meta = item.getItemMeta();
-        meta.displayName(name.decoration(TextDecoration.ITALIC, false));
+        meta.customName(name.decoration(TextDecoration.ITALIC, false));
         if (!lore.isEmpty()) meta.lore(lore);
         item.setItemMeta(meta);
         return item;

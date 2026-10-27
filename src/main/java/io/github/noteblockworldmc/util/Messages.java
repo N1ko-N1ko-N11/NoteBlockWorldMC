@@ -31,40 +31,30 @@ public class Messages {
     private static final MiniMessage MINI = MiniMessage.miniMessage();
 
     private final JavaPlugin plugin;
-    /** Replaced wholesale by reload(); volatile so the swap publishes safely. */
-    private volatile YamlConfiguration config;
-    /**
-     * Rendered components for keys used WITHOUT placeholders — button
-     * labels, headings, static lore. Those dominate a GUI page render (~100
-     * lookups), and MiniMessage re-parses the string every time otherwise.
-     * Components are immutable, so one instance can be shared freely.
-     */
-    private final Map<String, Component> staticCache = new ConcurrentHashMap<>();
-    /** Keys already reported missing/broken, so the log warns once, not per use. */
-    private final Set<String> reported = ConcurrentHashMap.newKeySet();
+    private record State(YamlConfiguration config, Map<String, Component> cache, Set<String> reported) {}
+    private volatile State state;
 
     public Messages(JavaPlugin plugin) {
         this.plugin = plugin;
         reload();
     }
 
-    public void reload() {
+    public void reload() { install(prepareReload()); }
+    public YamlConfiguration prepareReload() {
         File file = new File(plugin.getDataFolder(), "messages.yml");
-        if (!file.exists()) {
-            plugin.saveResource("messages.yml", false);
-        }
-        YamlConfiguration loaded = YamlConfiguration.loadConfiguration(file);
-
-        // Embedded defaults cover keys missing from the admin's file
-        InputStream embedded = plugin.getResource("messages.yml");
-        if (embedded != null) {
-            loaded.setDefaults(YamlConfiguration.loadConfiguration(
-                    new InputStreamReader(embedded, StandardCharsets.UTF_8)));
-        }
-        this.config = loaded;
-        // Cached renders belong to the old file
-        staticCache.clear();
-        reported.clear();
+        if (!file.exists()) plugin.saveResource("messages.yml", false);
+        YamlConfiguration loaded = new YamlConfiguration();
+        try {
+            loaded.load(file);
+            try (InputStream embedded = plugin.getResource("messages.yml")) {
+                if (embedded != null) loaded.setDefaults(YamlConfiguration.loadConfiguration(
+                        new InputStreamReader(embedded, StandardCharsets.UTF_8)));
+            }
+        } catch (Exception e) { throw new IllegalArgumentException("Could not read messages.yml; previous messages retained", e); }
+        return loaded;
+    }
+    public void install(YamlConfiguration loaded) {
+        state = new State(loaded, new ConcurrentHashMap<>(), ConcurrentHashMap.newKeySet());
     }
 
     /**
@@ -76,19 +66,20 @@ public class Messages {
      * happens to contain MiniMessage-looking punctuation.
      */
     public String getRaw(String key, String fallback) {
-        String raw = config.getString(key);
+        String raw = state.config().getString(key);
         return raw == null ? fallback : raw;
     }
 
     /** Deserializes a message with the given placeholders. */
     public Component get(String key, TagResolver... resolvers) {
+        State snapshot = state;
         boolean cacheable = resolvers.length == 0;
         if (cacheable) {
-            Component cached = staticCache.get(key);
+            Component cached = snapshot.cache().get(key);
             if (cached != null) return cached;
         }
 
-        String raw = config.getString(key);
+        String raw = snapshot.config().getString(key);
         if (raw == null) {
             // An outdated messages.yml renders raw keys in chat, which looks
             // like a plugin bug rather than a stale file. Say so once, so the
@@ -99,7 +90,7 @@ public class Messages {
         }
 
         Component rendered = render(key, raw, resolvers);
-        if (cacheable) staticCache.put(key, rendered);
+        if (cacheable) snapshot.cache().put(key, rendered);
         return rendered;
     }
 
@@ -122,7 +113,7 @@ public class Messages {
     }
 
     private void warnOnce(String key, String message) {
-        if (reported.add(key)) {
+        if (state.reported().add(key)) {
             plugin.getLogger().warning(message);
         }
     }
@@ -137,7 +128,7 @@ public class Messages {
 
     /** Deserializes a list-valued key (e.g. multi-line usage text). */
     public List<Component> getList(String key, TagResolver... resolvers) {
-        List<String> raw = config.getStringList(key);
+        List<String> raw = state.config().getStringList(key);
         if (raw.isEmpty()) {
             warnOnce(key, "messages.yml has no list at '" + key
                     + "'. Delete messages.yml to regenerate it.");

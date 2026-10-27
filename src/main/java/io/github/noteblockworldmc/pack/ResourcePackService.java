@@ -2,7 +2,7 @@ package io.github.noteblockworldmc.pack;
 
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
-import com.sun.net.httpserver.HttpServer;
+
 import io.github.noteblockworldmc.NoteblockWorldMCPlugin;
 import net.kyori.adventure.resource.ResourcePackInfo;
 import net.kyori.adventure.resource.ResourcePackRequest;
@@ -13,7 +13,10 @@ import org.bukkit.event.player.PlayerJoinEvent;
 import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.event.player.PlayerResourcePackStatusEvent;
 
-import java.io.ByteArrayOutputStream;
+import java.io.OutputStream;
+import java.nio.channels.FileChannel;
+import java.nio.file.LinkOption;
+import java.nio.file.StandardOpenOption;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.URI;
@@ -33,20 +36,13 @@ import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
 
 /**
- * Generates, hosts, and enforces the server resource pack.
+ * Generates and hosts a resource pack containing rate-shifted vanilla samples
+ * and custom instrument audio. Original samples plus up to three shifted
+ * octaves either side cover the NBS pitch range with Minecraft's runtime pitch.
  *
- * Contents are of two kinds. Extended-octave sound events: for each of the
- * 20 note block instruments, six events (_m3.._m1, _p1.._p3) reference the
- * VANILLA sound event (type "event" — no Mojang audio is copied) with a
- * baked pitch of 2^-3 .. 2^3. Combined with the runtime 0.5-2.0 pitch
- * range, base + ±3 octaves spans NBS keys 0-87: the full 88-key piano.
- * And custom instrument audio shipped with downloaded songs, subject to the
- * max-custom-sounds-mb budget; anything that is not Ogg Vorbis is skipped
- * with a warning, since Minecraft packs accept no other format.
- *
- * The pack is built in memory, written to the data folder for inspection,
- * hashed (SHA-1), and served by a tiny built-in HTTP server. rebuild()
- * regenerates and re-pushes whenever the library changes.
+ * Immutable pack files, SHA-1, and the generated event set are published together. Rebuilds
+ * run off-thread; per-push IDs keep stale resource-pack acknowledgements from
+ * opening playback's pack gate. An inspection ZIP is also written to disk.
  */
 public class ResourcePackService implements Listener {
 
@@ -69,10 +65,6 @@ public class ResourcePackService implements Listener {
             "trumpet", "trumpet_exposed", "trumpet_weathered", "trumpet_oxidized"
     };
 
-    /** Stable pack id: same pack slot across rebuilds, new hash per build. */
-    private static final UUID PACK_ID =
-            UUID.nameUUIDFromBytes("noteblockworldmc-pack".getBytes(StandardCharsets.UTF_8));
-
     private final NoteblockWorldMCPlugin plugin;
     private final Gson gson = new GsonBuilder().setPrettyPrinting().create();
 
@@ -86,10 +78,20 @@ public class ResourcePackService implements Listener {
      * not touch the bound socket, only what we tell clients to request.
      */
     private volatile String publicUrl;
-    private final int port;
-    private final String bindAddress;
-    private final int rateLimitPerMinute;
-    private final int maxConcurrentDownloads;
+    private int port;
+    private String bindAddress;
+    private volatile int configuredPackFormat;
+    private boolean settingsLoaded;
+    private final java.util.concurrent.atomic.AtomicBoolean refreshSourceCaches = new java.util.concurrent.atomic.AtomicBoolean();
+    private final java.util.concurrent.atomic.AtomicBoolean fetchingVanilla =
+            new java.util.concurrent.atomic.AtomicBoolean();
+    /**
+     * Both are consulted per HTTP request and nothing is constructed from
+     * them, so they are re-read with the other hot settings rather than
+     * forcing a restart to change a number.
+     */
+    private volatile int rateLimitPerMinute;
+    private volatile int maxConcurrentDownloads;
     private volatile boolean kickOnRefuse;
     private volatile long maxCustomSoundBytes;
     /**
@@ -108,27 +110,33 @@ public class ResourcePackService implements Listener {
     private final java.util.concurrent.atomic.AtomicBoolean rebuildPending =
             new java.util.concurrent.atomic.AtomicBoolean(false);
 
-    private HttpServer httpServer;
-    private java.util.concurrent.ExecutorService httpExecutor;
-    /** Downloads in flight, to cap concurrency. */
-    private final java.util.concurrent.atomic.AtomicInteger activeDownloads =
-            new java.util.concurrent.atomic.AtomicInteger();
-    /** Per-IP request counters for rate limiting: ip -> [windowStartMs, count]. */
-    private final Map<String, long[]> requestCounts = new ConcurrentHashMap<>();
-    /**
-     * The built pack and its hash, published together.
-     *
-     * These must move as ONE value: hashing several megabytes takes long
-     * enough that assigning them separately leaves a window where the HTTP
-     * server serves the new bytes while send() still advertises the old
-     * SHA-1. A client joining in that window fails its hash check -- and
-     * with kick-on-refuse, gets kicked for the server's own race.
-     */
-    private record PackData(byte[] bytes, String sha1) {}
+    private volatile PackHttpServer httpServer;
+    private final Map<String, long[]> requestCounts = new java.util.HashMap<>();
+    private record PackData(Path file, long size, String sha1, Set<String> events, Map<String, Double> seconds) {}
+    private final Object buildLock = new Object();
+    private final Object rateLimitLock = new Object();
+    private final SampleCache customSamples = new SampleCache(32L * 1024 * 1024);
+    private org.bukkit.scheduler.BukkitTask cleanupTask;
+    private final java.util.concurrent.atomic.AtomicBoolean cleanupPending = new java.util.concurrent.atomic.AtomicBoolean();
+    private boolean storagePrepared;
+    private record Installed(UUID request, String sha1, Set<String> events, Map<String, Double> seconds) {}
+    private final Map<String, PackData> generations = new ConcurrentHashMap<>();
+    private final Map<String, Long> advertisedAt = new ConcurrentHashMap<>();
+    private final Map<UUID, Installed> installed = new ConcurrentHashMap<>();
+    private final Map<UUID, Installed> requested = new ConcurrentHashMap<>();
+    private static final long RETENTION_MS = 600_000;
+    private static final long GENERATION_BYTES = 256L * 1024 * 1024;
+    private static final long MAX_PACK_BYTES = 96L * 1024 * 1024;
+    private final Map<String, Double> buildingSeconds = new LinkedHashMap<>();
+    private final Object generationLock = new Object();
     private volatile PackData pack;
-    /** Sound events actually present in the current pack (no namespace). */
-    private volatile java.util.Set<String> generatedEvents = java.util.Set.of();
+    /** Pins an existing generation while a builder prepares to publish it again. Guarded by generationLock. */
+    private PackData publishing;
     private final VanillaSounds vanillaSounds;
+
+    /** Each push has its own ID so old or unrelated status events cannot unlock playback. */
+    private final Map<UUID, UUID> requestedPackIds = new ConcurrentHashMap<>();
+    private final Map<UUID, String> requestedUrls = new ConcurrentHashMap<>();
 
     /** Players whose client confirmed the pack loaded. */
     private final Set<UUID> packLoaded = ConcurrentHashMap.newKeySet();
@@ -170,23 +178,6 @@ public class ResourcePackService implements Listener {
 
     public ResourcePackService(NoteblockWorldMCPlugin plugin) {
         this.plugin = plugin;
-        // Seeded here so the loadHotSettings() call at the end of this
-        // constructor sees no CHANGE and therefore starts nothing. The plugin
-        // calls start() itself once everything is wired; without these two
-        // lines a config with the pack enabled would look like an off->on
-        // transition and bind the socket from inside the constructor.
-        this.enabled = plugin.getConfig().getBoolean("resource-pack.enabled", false);
-        this.publicUrl = resolvePublicUrl(
-                plugin.getConfig().getString("resource-pack.public-url", ""),
-                plugin.getConfig().getInt("resource-pack.port", 8194));
-        // Fixed for the lifetime of the server: the HTTP server binds these
-        this.port = plugin.getConfig().getInt("resource-pack.port", 8194);
-        this.bindAddress = plugin.getConfig()
-                .getString("resource-pack.bind-address", "0.0.0.0");
-        this.rateLimitPerMinute = Math.max(0, plugin.getConfig()
-                .getInt("resource-pack.rate-limit-per-minute", 30));
-        this.maxConcurrentDownloads = Math.max(1, plugin.getConfig()
-                .getInt("resource-pack.max-concurrent-downloads", 16));
         this.vanillaSounds = new VanillaSounds(plugin);
         loadHotSettings();
     }
@@ -210,13 +201,19 @@ public class ResourcePackService implements Listener {
         if (!value.equalsIgnoreCase("auto") && !value.toLowerCase(java.util.Locale.ROOT).startsWith("auto:")) {
             return value;   // blank or an explicit URL -- unchanged
         }
+        if (value.toLowerCase(Locale.ROOT).startsWith("auto:")) {
+            try { port = Integer.parseInt(value.substring(5)); }
+            catch (NumberFormatException e) { throw new IllegalArgumentException("Expected auto:PORT", e); }
+            if (port < 1 || port > 65535) throw new IllegalArgumentException("auto:PORT must be between 1 and 65535");
+        }
         String detected = detectOutboundIp();
         if (detected == null) {
             plugin.getLogger().warning("resource-pack.public-url is \"auto\" but this server's"
                     + " outbound IP could not be detected. Set public-url to a real address.");
             return "";
         }
-        String url = "http://" + detected + ":" + port + "/pack.zip";
+        String host = detected.contains(":") ? "[" + detected + "]" : detected;
+        String url = "http://" + host + ":" + port + "/pack.zip";
         plugin.getLogger().info("resource-pack.public-url auto-detected as " + url
                 + ". If players outside your network cannot load the pack, this is the"
                 + " LAN address -- set public-url manually to your public IP or domain.");
@@ -247,243 +244,282 @@ public class ResourcePackService implements Listener {
         }
     }
 
-    /**
-     * (Re)reads the settings that can change at runtime. Called on startup
-     * and by /nbw reload, so both paths always read the same keys.
-     *
-     * port and bind-address are still NOT here: the socket is bound to them,
-     * and re-binding mid-session would drop pack downloads in flight. Those
-     * need a restart. enabled and public-url are handled, because neither
-     * requires touching a live socket -- one starts or stops the server, the
-     * other only changes the address we hand to clients.
-     */
-    public void loadHotSettings() {
-        var config = plugin.getConfig();
-        boolean wasEnabled = this.enabled;
-        String previousUrl = this.publicUrl;
-        this.enabled = config.getBoolean("resource-pack.enabled", false);
-        this.publicUrl = resolvePublicUrl(
-                config.getString("resource-pack.public-url", ""), port);
-        this.kickOnRefuse = config.getBoolean("resource-pack.kick-on-refuse", true);
-        this.repushOnRemove = config.getBoolean("resource-pack.repush-on-remove", false);
-        this.maxCustomSoundBytes =
-                config.getLong("resource-pack.max-custom-sounds-mb", 64) * 1024 * 1024;
-        this.rebuildDebounceTicks =
-                20L * config.getInt("resource-pack.rebuild-debounce-seconds", 3);
-        this.settleDelayMillis =
-                Math.max(0, config.getLong("resource-pack.settle-delay-ms", 2000));
-
-        applyServerStateChange(wasEnabled, previousUrl);
-    }
-
-    /**
-     * Starts, stops or re-advertises the pack server after a reload.
-     *
-     * Called only from loadHotSettings, and only ever on the main thread, so
-     * the start/stop pair cannot interleave with itself.
-     */
-    private void applyServerStateChange(boolean wasEnabled, String previousUrl) {
-        // Startup runs loadHotSettings before start(), when nothing is bound
-        // yet; there is no transition to apply and start() follows anyway.
-        if (!wasEnabled && !this.enabled) return;
-
-        if (!wasEnabled) {
-            plugin.getLogger().info("resource-pack.enabled turned on; starting the pack server.");
-            start();
-            return;
+    /** Prepares a replacement listener without changing any live setting; bind failure leaves the old service intact. */
+    public Runnable prepareSettings(org.bukkit.configuration.file.FileConfiguration config) {
+        io.github.noteblockworldmc.util.SettingsValidator.validate(config);
+        int nextPort = config.getInt("resource-pack.port", 8194);
+        String nextBind = config.getString("resource-pack.bind-address", "0.0.0.0").trim();
+        if (nextBind.isEmpty()) throw new IllegalArgumentException("resource-pack.bind-address is empty");
+        String nextUrl = resolvePublicUrl(config.getString("resource-pack.public-url", ""), nextPort);
+        validatePublicUrl(nextUrl);
+        boolean nextEnabled = config.getBoolean("resource-pack.enabled", false);
+        boolean wantsServer = nextEnabled && !nextUrl.isBlank();
+        boolean socketChanged = nextPort != port || !java.util.Objects.equals(nextBind, bindAddress);
+        boolean wasActive = isActive();
+        String oldUrl = publicUrl;
+        int format = resolvePackFormat(config.get("resource-pack.pack-format"), serverVersion());
+        long budget = config.getLong("resource-pack.max-custom-sounds-mb", 64) * 1024L * 1024;
+        boolean contentChanged = budget != maxCustomSoundBytes || format != configuredPackFormat;
+        PackHttpServer prepared;
+        try {
+            prepared = settingsLoaded && wantsServer && (!wasActive || socketChanged)
+                    ? bindReplacing(new InetSocketAddress(nextBind, nextPort)) : httpServer;
+        } catch (IOException | RuntimeException e) {
+            throw new IllegalStateException("Could not bind resource-pack server; previous settings retained", e);
         }
-        if (!this.enabled) {
-            plugin.getLogger().info("resource-pack.enabled turned off; stopping the pack server. "
-                    + "Players already holding the pack keep it until they reconnect.");
-            stopServer();
-            return;
-        }
-
-        // Still enabled, but the address changed -- most often an admin fixing
-        // a URL players could not reach. Re-send it so the people affected get
-        // the pack now instead of on their next login.
-        if (!java.util.Objects.equals(previousUrl, this.publicUrl)) {
-            plugin.getLogger().info("resource-pack.public-url changed to " + this.publicUrl
-                    + "; re-sending the pack to online players.");
-            if (isActive()) {
-                for (Player online : plugin.getServer().getOnlinePlayers()) {
-                    // Not an initial send, so a failure warns rather than
-                    // kicking someone over an address they cannot control.
-                    send(online);
-                }
-            } else {
-                // The URL was blank or invalid at boot, so nothing was ever
-                // bound; a corrected address should bring the server up.
-                start();
+        return () -> {
+            enabled = nextEnabled; port = nextPort; bindAddress = nextBind; publicUrl = nextUrl;
+            configuredPackFormat = format; maxCustomSoundBytes = budget;
+            warnAboutPackFormat(config.get("resource-pack.pack-format"), format);
+            kickOnRefuse = config.getBoolean("resource-pack.kick-on-refuse", true);
+            repushOnRemove = config.getBoolean("resource-pack.repush-on-remove", false);
+            rebuildDebounceTicks = 20L * config.getInt("resource-pack.rebuild-debounce-seconds", 3);
+            settleDelayMillis = config.getLong("resource-pack.settle-delay-ms", 2000);
+            rateLimitPerMinute = config.getInt("resource-pack.rate-limit-per-minute", 30);
+            maxConcurrentDownloads = config.getInt("resource-pack.max-concurrent-downloads", 16);
+            if (!settingsLoaded) { settingsLoaded = true; return; }
+            PackHttpServer previous = httpServer;
+            httpServer = wantsServer ? prepared : null;
+            if (previous != null && previous != httpServer) previous.close();
+            if (contentChanged || !wasActive && isActive()) onLibraryChanged();
+            else if (isActive() && (socketChanged || !java.util.Objects.equals(oldUrl, publicUrl))) {
+                for (Player player : plugin.getServer().getOnlinePlayers()) send(player);
             }
+        };
+    }
+    public void loadHotSettings() { prepareSettings(plugin.getConfig()).run(); }
+
+    private static void validatePublicUrl(String value) {
+        if (value.isBlank()) return;
+        URI uri = URI.create(value);
+        if (uri.getRawQuery() != null || uri.getRawFragment() != null || uri.getUserInfo() != null
+                || uri.getPort() == 0 || uri.getPort() > 65535
+                || !"/pack.zip".equals(uri.getPath()) || uri.getHost() == null || !("http".equalsIgnoreCase(uri.getScheme())
+                || "https".equalsIgnoreCase(uri.getScheme()))) {
+            throw new IllegalArgumentException("resource-pack.public-url must be auto, empty, or an absolute HTTP(S) URL"
+                    + " whose path is exactly /pack.zip, with no query or credentials");
         }
     }
 
-    /** Builds the pack and starts the HTTP server. Hosting/enforcement is
-     *  skipped unless enabled, but the inspection copy is always written so
-     *  owners can preview the pack before turning enforcement on. */
+    /** Explicit reload also refreshes manually supplied audio and retries failed asset lookups. */
+    public void reloadContent() {
+        refreshSourceCaches.set(true);
+        vanillaSounds.resetLookupFailures();
+        onLibraryChanged();
+        if (plugin.getConfig().getBoolean("resource-pack.download-vanilla-sounds", true)) {
+            fetchVanillaSoundsAsync();
+        }
+    }
+
+    /** Builds an inspection copy even with hosting disabled. */
     public void start() {
-        // Idempotent: reload can reach this while a server is already bound,
-        // and HttpServer.create would then throw BindException and leave the
-        // catch below nulling out a perfectly good server.
-        stopServer();
-
-        // Sounds are cached after the first run, so this is normally a no-op.
-        // When they ARE missing, the fetch happens off-thread: 20 downloads
-        // against a slow CDN would otherwise stall the whole server boot.
-        boolean fetchNeeded = plugin.getConfig()
-                .getBoolean("resource-pack.download-vanilla-sounds", true)
-                && !vanillaSounds.hasAll();
-
-        if (!enabled) {
-            // The inspection copy is written even when the pack is switched
-            // off, but there is nobody to serve it to, so nothing to push.
-            buildPackAsync(false);
-            if (fetchNeeded) fetchVanillaSoundsAsync();
-            return;
-        }
-        // Validated once here rather than on every join: URI.create throws an
-        // UNCHECKED exception, which inside the join handler would surface as
-        // a stack trace per player with the pack silently never arriving.
-        try {
-            URI.create(publicUrl == null ? "" : publicUrl);
-        } catch (IllegalArgumentException e) {
-            plugin.getLogger().severe("resource-pack.public-url is not a valid URL ("
-                    + publicUrl + ") — pack disabled.");
-            if (fetchNeeded) fetchVanillaSoundsAsync();
-            return;
-        }
-        if (publicUrl == null || publicUrl.isBlank()) {
-            plugin.getLogger().severe("resource-pack.enabled is true but resource-pack.public-url "
-                    + "is empty. Set it to a URL players can reach, e.g. "
-                    + "http://your.server.address:" + port + "/pack.zip — pack disabled.");
-            if (fetchNeeded) fetchVanillaSoundsAsync();
-            return;
-        }
-        try {
-            httpServer = HttpServer.create(
-                    new InetSocketAddress(bindAddress, port), 32);
-            httpServer.createContext("/pack.zip", this::handlePackRequest);
-            // The pack carries audio (megabytes). With too few threads, one slow
-            // client stalls every other download until their client gives up --
-            // and kick-on-refuse would then boot legitimate players.
-            this.httpExecutor = java.util.concurrent.Executors.newFixedThreadPool(8, runnable -> {
-                Thread thread = new Thread(runnable, "NoteblockWorldMC-pack-http");
-                thread.setDaemon(true);   // must not outlive the plugin
-                return thread;
-            });
-            httpServer.setExecutor(httpExecutor);
-            httpServer.start();
-            plugin.getLogger().info("Resource pack served on port " + port
-                    + " (public URL: " + publicUrl + ")");
-
-            // Binding the socket is cheap; BUILDING the pack is not -- it reads
-            // every custom sound and generates six octave variants of each, then
-            // writes the zip. Doing that inline stalled startup and every
-            // /nbw reload in proportion to library size. The server is up first
-            // and answers 503 until the bytes exist, and the push to players
-            // already online happens once the build lands.
-            buildPackAsync(true);
-        } catch (Exception e) {
-            plugin.getLogger().severe("Could not start the resource pack server: " + e);
-            httpServer = null;
-        } finally {
-            if (fetchNeeded) {
-                fetchVanillaSoundsAsync();
+        // Players already online across a plugin reload never fire a join.
+        for (Player online : org.bukkit.Bukkit.getOnlinePlayers()) trackSource(online);
+        if (enabled && !publicUrl.isBlank()) {
+            try { bindServer(); }
+            catch (IOException | RuntimeException e) {
+                plugin.getLogger().severe("Could not start the resource-pack server: " + e);
             }
+        } else if (enabled) {
+            plugin.getLogger().warning("Resource-pack hosting needs a reachable public-url.");
+        }
+        if (cleanupTask == null) cleanupTask = org.bukkit.Bukkit.getScheduler().runTaskTimer(plugin, () -> {
+            if (plugin.isStopping() || !cleanupPending.compareAndSet(false, true)) return;
+            plugin.getWorkPool().run(() -> {
+                try { expireGenerations(System.currentTimeMillis()); }
+                catch (IOException e) { throw new java.util.concurrent.CompletionException(e); }
+            }).whenComplete((unused, error) -> {
+                cleanupPending.set(false);
+                if (error != null && !plugin.isStopping()) plugin.getLogger().warning("Pack cleanup failed: " + error);
+            });
+        }, 1200L, 1200L);
+        buildPackAsync(isActive());
+        if (plugin.getConfig().getBoolean("resource-pack.download-vanilla-sounds", true)) {
+            fetchVanillaSoundsAsync();
+        }
+    }
+
+    private PackHttpServer newServer(InetSocketAddress address) throws IOException {
+        return new PackHttpServer(address, this::lookupPack, this::isRateLimited, this::isTrustedSource,
+                () -> maxConcurrentDownloads, 60_000);
+    }
+
+    /**
+     * Binds the listener a reload asks for while the current one keeps serving.
+     *
+     * Moving between the wildcard and one interface on the SAME port (the
+     * 0.0.0.0 to 127.0.0.1 reverse-proxy switch config.yml recommends) can
+     * never overlap: the OS refuses the second bind while the first listens,
+     * so that reload always failed. For that case only, the old listener is
+     * released first; if the new address still cannot be bound, the old one
+     * is restored and the reload is refused as before.
+     */
+    private PackHttpServer bindReplacing(InetSocketAddress target) throws IOException {
+        try {
+            return newServer(target);
+        } catch (java.net.BindException conflict) {
+            PackHttpServer current = httpServer;
+            if (current == null || target.getPort() != port) throw conflict;
+            current.close();
+            try {
+                return newServer(target);
+            } catch (IOException | RuntimeException retry) {
+                conflict.addSuppressed(retry);
+                try {
+                    httpServer = newServer(new InetSocketAddress(bindAddress, port));
+                } catch (IOException | RuntimeException restore) {
+                    httpServer = null;
+                    conflict.addSuppressed(restore);
+                    plugin.getLogger().severe("The previous resource-pack listener on " + bindAddress + ":" + port
+                            + " could not be restored; fix the address and run /nbw reload: " + restore);
+                }
+                throw conflict;
+            }
+        }
+    }
+
+    /** A new listener is prepared before the old endpoint is released. */
+    private void bindServer() throws IOException {
+        PackHttpServer replacement = newServer(new InetSocketAddress(bindAddress, port));
+        PackHttpServer previous = httpServer;
+        httpServer = replacement;
+        if (previous != null) previous.close();
+        plugin.getLogger().info("Resource pack served on " + bindAddress + ":" + port
+                + " using " + replacement.name());
+    }
+
+    private FileChannel lookupPack(String target) {
+        // Only a content-addressed generation is served; no filesystem path comes from HTTP.
+        String requestedSha;
+        if ("/pack.zip".equals(target)) {
+            PackData current = pack;
+            requestedSha = current == null ? null : current.sha1();
+        } else if (target.matches("/pack\\.zip\\?v=[0-9a-f]{40}")) {
+            requestedSha = target.substring(target.indexOf("?v=") + 3);
+        } else {
+            return null;
+        }
+        if (requestedSha == null) return null;
+        synchronized (generationLock) {
+            PackData found = generations.get(requestedSha);
+            if (found == null) return null;
+            try { return FileChannel.open(found.file(), StandardOpenOption.READ, LinkOption.NOFOLLOW_LINKS); }
+            catch (IOException e) { return null; }
         }
     }
 
     /**
-     * Serves the pack.
-     *
-     * The request is never used to look anything up — the response is a byte
-     * array already in memory — so there is no path, query, or header that
-     * could reach a filesystem, database, or interpreter. What this DOES need
-     * protecting from is abuse: the pack is megabytes, and a flood (or a few
-     * slow connections) could starve real players of their download and, with
-     * kick-on-refuse enabled, get them disconnected.
+     * Rate-limit keys of online players' addresses, counted per player.
+     * Updated on the main thread, read by the HTTP threads.
      */
-    private void handlePackRequest(com.sun.net.httpserver.HttpExchange exchange)
-            throws IOException {
-        try {
-            PackData current = pack;
-            byte[] bytes = current == null ? null : current.bytes();
+    private final Map<UUID, String> playerSources = new ConcurrentHashMap<>();
+    private final Map<String, Integer> trustedSources = new ConcurrentHashMap<>();
 
-            // Exact path only; the context would otherwise also match /pack.zip/...
-            if (!"/pack.zip".equals(exchange.getRequestURI().getPath())) {
-                exchange.sendResponseHeaders(404, -1);
-                return;
-            }
-            if (!"GET".equalsIgnoreCase(exchange.getRequestMethod())) {
-                exchange.sendResponseHeaders(405, -1);
-                return;
-            }
-            if (bytes == null) {
-                exchange.sendResponseHeaders(503, -1);   // not built yet
-                return;
-            }
-            if (isRateLimited(exchange.getRemoteAddress().getAddress().getHostAddress())) {
-                exchange.sendResponseHeaders(429, -1);   // Too Many Requests
-                return;
-            }
-            if (activeDownloads.incrementAndGet() > maxConcurrentDownloads) {
-                // MUST release the slot we just claimed. Returning without
-                // this leaks one permit per rejection, so after
-                // max-concurrent-downloads rejections the counter never falls
-                // back under the limit and the pack becomes permanently
-                // unservable -- with kick-on-refuse on, that kicks everyone
-                // who joins, until the server restarts.
-                activeDownloads.decrementAndGet();
-                exchange.sendResponseHeaders(503, -1);   // busy; client retries
-                return;
-            }
-            try {
-                exchange.getResponseHeaders().set("Content-Type", "application/zip");
-                exchange.getResponseHeaders().set("X-Content-Type-Options", "nosniff");
-                exchange.sendResponseHeaders(200, bytes.length);
-                try (var out = exchange.getResponseBody()) {
-                    out.write(bytes);
-                }
-            } finally {
-                activeDownloads.decrementAndGet();
-            }
-        } catch (IOException e) {
-            // A client that hangs up mid-download is routine, not an error
-        } finally {
-            exchange.close();
+    private void trackSource(Player player) {
+        java.net.InetSocketAddress address = player.getAddress();
+        if (address == null || address.getAddress() == null) return;
+        String key = rateLimitKey(address.getAddress().getHostAddress());
+        String previous = playerSources.put(player.getUniqueId(), key);
+        if (key.equals(previous)) return;
+        if (previous != null) untrackKey(previous);
+        trustedSources.merge(key, 1, Integer::sum);
+    }
+
+    private void untrackSource(UUID playerId) {
+        String key = playerSources.remove(playerId);
+        if (key != null) untrackKey(key);
+    }
+
+    private void untrackKey(String key) {
+        trustedSources.computeIfPresent(key, (k, n) -> n <= 1 ? null : n - 1);
+    }
+
+    /**
+     * Online players, and anything on this machine or the local network
+     * (a reverse proxy, a container port-forwarder, a LAN), may use the
+     * whole download pool; strangers share part of it.
+     */
+    private boolean isTrustedSource(String ip) {
+        if (isLocalNetwork(ip)) return true;
+        return trustedSources.containsKey(rateLimitKey(ip));
+    }
+
+    /**
+     * Loopback, private (10/8, 172.16/12, 192.168/16, fc00::/7) and
+     * link-local sources. A TCP peer cannot fake one of these from the
+     * internet; seeing one usually means a proxy or NAT that hides the real
+     * client, so per-address limits would lump every player together.
+     */
+    static boolean isLocalNetwork(String ip) {
+        if (ip == null) return false;
+        try {
+            java.net.InetAddress address = java.net.InetAddress.ofLiteral(ip.replaceFirst("%.*$", ""));
+            byte[] bytes = address.getAddress();
+            return address.isLoopbackAddress() || address.isSiteLocalAddress() || address.isLinkLocalAddress()
+                    || (bytes.length == 16 && (bytes[0] & 0xfe) == 0xfc);
+        } catch (IllegalArgumentException e) {
+            return false;
         }
     }
 
-    /** Fixed-window limiter, per source IP. */
+    /**
+     * Fixed-window limiter, per source IPv4 address or IPv6 /64. Local and
+     * private sources are exempt: behind a reverse proxy or container
+     * port-forwarder every player's download arrives from one such address,
+     * so counting it as one client refused the 31st download in a minute --
+     * and with kick-on-refuse, kicked that player.
+     */
     private boolean isRateLimited(String ip) {
-        if (rateLimitPerMinute <= 0) return false;
-
-        long now = System.currentTimeMillis();
-        // Bound the map so a spoofed-IP flood can't grow it without limit
-        if (requestCounts.size() > 10_000) {
-            requestCounts.entrySet().removeIf(e -> now - e.getValue()[0] > 60_000);
-        }
-        long[] window = requestCounts.computeIfAbsent(ip, key -> new long[]{now, 0});
-        synchronized (window) {
-            if (now - window[0] > 60_000) {          // new minute
-                window[0] = now;
-                window[1] = 0;
+        if (rateLimitPerMinute <= 0 || isLocalNetwork(ip)) return false;
+        ip = rateLimitKey(ip);
+        synchronized (rateLimitLock) {
+            long now = System.currentTimeMillis();
+            if (!requestCounts.containsKey(ip) && requestCounts.size() >= 10_000) {
+                requestCounts.entrySet().removeIf(e -> now - e.getValue()[0] > 60_000);
+                if (requestCounts.size() >= 10_000) return true;
             }
+            long[] window = requestCounts.computeIfAbsent(ip, key -> new long[]{now, 0});
+            if (now - window[0] > 60_000) { window[0] = now; window[1] = 0; }
             return ++window[1] > rateLimitPerMinute;
         }
     }
 
     /**
+     * One IPv6 subscriber is normally handed a whole /64, so keying by the
+     * full address let a single host rotate through fresh addresses: it was
+     * never limited, and after 10,000 addresses in a minute the full table
+     * turned every legitimate newcomer away. Counting the /64 prefix keeps
+     * one subscriber to one bucket.
+     */
+    static String rateLimitKey(String ip) {
+        return PackHttpServer.sourceKey(ip);
+    }
+
+    /**
      * Full shutdown, for plugin disable.
      *
-     * Closes the vanilla-sound downloader as well, which a reload-driven
-     * disable must NOT do -- its HTTP client cannot be reopened, so a later
-     * re-enable would be unable to fetch anything.
+     * Removes only this instance's installed/pending client packs, including
+     * during a full plugin reload. Hot configuration changes use stopServer().
      */
     public void stop() {
+        if (cleanupTask != null) { cleanupTask.cancel(); cleanupTask = null; }
         stopServer();
+        for (Player player : plugin.getServer().getOnlinePlayers()) {
+            Set<UUID> owned = new java.util.HashSet<>();
+            Installed loaded = installed.get(player.getUniqueId());
+            Installed pending = requested.get(player.getUniqueId());
+            if (loaded != null) owned.add(loaded.request());
+            if (pending != null) owned.add(pending.request());
+            for (UUID id : owned) {
+                try { player.removeResourcePacks(id); }
+                catch (RuntimeException e) { plugin.getLogger().warning("Could not remove music pack for " + player.getName() + ": " + e); }
+            }
+        }
+        installed.clear(); requested.clear(); requestedPackIds.clear(); requestedUrls.clear();
+        packLoaded.clear(); packResolved.clear(); resolvedAtMillis.clear();
+        awaitingInitialPack.clear(); packSentAtMillis.clear();
         vanillaSounds.close();
+        customSamples.clear();
     }
 
     /**
@@ -491,20 +527,12 @@ public class ResourcePackService implements Listener {
      * usable so the pack can be switched back on without a restart.
      *
      * Players already holding the pack keep it until they reconnect; there is
-     * no way to ask a client to forget one, and taking it away mid-session
+     * no removal request here, and taking it away mid-session
      * would silence any song using custom sounds.
      */
     private void stopServer() {
-        if (httpServer != null) {
-            httpServer.stop(0);
-            httpServer = null;
-        }
-        // Without this the pool's threads (and the plugin's classloader)
-        // survive a disable/reload, and the port can stay bound.
-        if (httpExecutor != null) {
-            httpExecutor.shutdownNow();
-            httpExecutor = null;
-        }
+        PackHttpServer previous = httpServer; httpServer = null;
+        if (previous != null) previous.close();
     }
 
     /**
@@ -512,31 +540,30 @@ public class ResourcePackService implements Listener {
      * players who joined in the meantime get the octave-enabled pack.
      */
     private void fetchVanillaSoundsAsync() {
-        org.bukkit.Bukkit.getScheduler().runTaskAsynchronously(plugin, () -> {
-            int available;
+        if (!fetchingVanilla.compareAndSet(false, true)) return;
+        plugin.getWorkPool().run(() -> {
             try {
-                available = vanillaSounds.ensureDownloaded();
-            } catch (Exception e) {
-                plugin.getLogger().warning("Could not fetch vanilla note block sounds: " + e
-                        + " — extended octaves unavailable for vanilla instruments.");
-                return;
-            }
-            if (available == 0) {
-                plugin.getLogger().warning("No vanilla note block sounds available — "
-                        + "extended octaves unavailable (notes fold into the vanilla range). "
-                        + "Custom instruments are unaffected.");
-                return;
-            }
-            org.bukkit.Bukkit.getScheduler().runTask(plugin, () -> {
-                if (isActive()) {
-                    onLibraryChanged();       // rebuild + invalidate + re-push
-                } else {
-                    // Off-thread for the same reason as startup: this lands
-                    // after a vanilla-sound download, so the pack is being
-                    // built from scratch and is at its most expensive.
-                    buildPackAsync(false);
+                if (vanillaSounds.isComplete()) return;
+                int available = vanillaSounds.ensureDownloaded();
+                if (available == 0) {
+                    plugin.getLogger().warning("No vanilla note-block samples available; extended notes will fold.");
+                    return;
                 }
-            });
+                // A verification pass that kept every cached file changes nothing in the pack.
+                if (!vanillaSounds.consumeChanged()) return;
+                refreshSourceCaches.set(true);
+                if (plugin.isEnabled()) {
+                    plugin.runMain(this::onLibraryChanged);
+                }
+            } catch (Exception e) {
+                plugin.getLogger().warning("Could not fetch vanilla note-block sounds: " + e);
+            }
+        }).whenComplete((unused, error) -> {
+            // Admission can fail before the worker runs, so worker-only
+            // cleanup would permanently suppress every subsequent retry.
+            fetchingVanilla.set(false);
+            if (error != null && !plugin.isStopping())
+                plugin.getLogger().warning("Vanilla sound fetch was not completed; retry /nbw reload: " + error);
         });
     }
 
@@ -544,50 +571,35 @@ public class ResourcePackService implements Listener {
         return enabled && httpServer != null;
     }
 
-    /** One pre-shifted vanilla octave variant, cached across rebuilds. */
-    private record OctaveEntry(String event, String path, byte[] bytes) {}
-
-    /**
-     * The 120 vanilla octave variants never change once the vanilla sounds
-     * are on disk, yet every rebuild used to re-read and re-shift all of
-     * them — the bulk of the rebuild players wait through after a
-     * custom-song download. Cached after first generation; regenerated only
-     * if the number of available source files changes (i.e. the async
-     * vanilla fetch completed in between).
-     */
-    private volatile List<OctaveEntry> vanillaOctaveCache;
-    private volatile int vanillaOctaveSourceCount = -1;
-
-    /** Measured ring time of a vanilla instrument's sample, or -1. */
+    /** Read/validate once per source revision; callers share its measured duration. */
     public double sampleSeconds(int instrument) {
         if (instrument < 0 || instrument >= INSTRUMENT_NAMES.length) return -1;
-        Double cached = sampleSecondsCache.get(instrument);
-        if (cached != null) return cached;
-
-        double seconds = -1;
-        java.nio.file.Path file = vanillaSounds.get(INSTRUMENT_NAMES[instrument]);
-        if (file != null) {
-            try {
-                seconds = OggTools.readDurationSeconds(Files.readAllBytes(file));
-            } catch (IOException ignored) {
-                // leave as -1; the caller falls back to an estimate
-            }
-        }
-        // Only cache successes: a read that failed because the vanilla sounds
-        // had not downloaded yet would otherwise pin -1 for the rest of the
-        // session, leaving voice allocation on its crude 1-second fallback
-        // even after the sounds arrive.
-        if (seconds > 0) {
-            sampleSecondsCache.put(instrument, seconds);
-        }
-        return seconds;
+        return vanillaSounds.sampleSeconds(INSTRUMENT_NAMES[instrument]);
     }
-
-    private final Map<Integer, Double> sampleSecondsCache = new ConcurrentHashMap<>();
 
     /** True if the pack actually contains this sound event. */
     public boolean hasEvent(String event) {
-        return generatedEvents.contains(event);
+        PackData current = pack;
+        return current != null && event != null && current.events().contains(event);
+    }
+
+    /** Availability and duration belong to the generation this particular listener acknowledged. */
+    public boolean hasEvent(UUID playerId, String event) {
+        Installed current = installed.get(playerId);
+        return current != null && current.events().contains(event);
+    }
+    public double eventSeconds(UUID playerId, String event) {
+        Installed current = installed.get(playerId);
+        return current == null ? -1 : current.seconds().getOrDefault(event, -1.0);
+    }
+    public Map<String, Double> eventDurations(UUID listener) {
+        if (listener == null) { PackData current = pack; return current == null ? Map.of() : current.seconds(); }
+        Installed current = installed.get(listener); return current == null ? Map.of() : current.seconds();
+    }
+
+    public double eventSeconds(String event) {
+        PackData current = pack;
+        return current == null ? -1 : current.seconds().getOrDefault(event, -1.0);
     }
 
     public String getPackSha1() {
@@ -597,11 +609,12 @@ public class ResourcePackService implements Listener {
 
     public int getPackSize() {
         PackData current = pack;
-        return current == null ? 0 : current.bytes().length;
+        return current == null ? 0 : (int) current.size();
     }
 
     public int getEventCount() {
-        return generatedEvents.size();
+        PackData current = pack;
+        return current == null ? 0 : current.events().size();
     }
 
     public boolean isEnabled() {
@@ -612,9 +625,34 @@ public class ResourcePackService implements Listener {
         return publicUrl;
     }
 
+    /** The address actually bound by the listener, for diagnosing host firewall/NAT issues. */
+    public String getBoundAddress() {
+        PackHttpServer current = httpServer;
+        if (current == null) return "(inactive)";
+        try {
+            InetSocketAddress address = current.address();
+            return address.getHostString() + ":" + address.getPort();
+        } catch (IOException e) {
+            return "(unavailable)";
+        }
+    }
+
+    /** Transport selected for the active listener, useful when diagnosing a host-specific issue. */
+    public String getTransportName() {
+        PackHttpServer current = httpServer;
+        return current == null ? "(inactive)" : current.name();
+    }
+
+    /** URL a browser can use to download the current pack; Minecraft adds its hash automatically. */
+    public String getDownloadUrl() {
+        PackData current = pack;
+        if (current == null || publicUrl.isBlank()) return "(unavailable)";
+        return publicUrl + "?v=" + current.sha1();
+    }
+
     /** True once this player's client confirmed the pack is loaded. */
     public boolean isPackLoaded(UUID playerId) {
-        return packLoaded.contains(playerId);
+        return installed.containsKey(playerId);
     }
 
     /**
@@ -637,11 +675,34 @@ public class ResourcePackService implements Listener {
      * case) passes instantly; only someone who just reloaded actually waits.
      */
     public boolean isSettled(UUID playerId) {
+        return settled(playerId, true);
+    }
+
+    /**
+     * Whether a song that is ALREADY playing should reach this player.
+     *
+     * Unlike {@link #isSettled}, a rebuild that has been requested but not yet
+     * pushed does not count: the client still has the pack it had a moment
+     * ago, so muting it only cut every running song for the debounce, build
+     * and settle time -- even on a /nbw reload that changed nothing. A push
+     * that is actually outstanding still mutes, since the client is
+     * reloading its resources.
+     */
+    public boolean canHear(UUID playerId) {
+        return settled(playerId, false);
+    }
+
+    private boolean settled(UUID playerId, boolean holdForRebuild) {
         if (!isActive()) return true;
         long now = System.currentTimeMillis();
+        long invalidated = invalidatedAtMillis;
+        boolean rebuildComing = holdForRebuild && invalidated != 0 && now - invalidated < RESOLUTION_TIMEOUT_MS;
 
         Long resolvedAt = resolvedAtMillis.get(playerId);
         if (resolvedAt != null) {
+            // A start waits for a requested rebuild the player has not yet
+            // resolved; resolution itself is no longer wiped when one is requested.
+            if (rebuildComing && resolvedAt < invalidated) return false;
             return now - resolvedAt >= settleDelayMillis;
         }
 
@@ -658,8 +719,7 @@ public class ResourcePackService implements Listener {
             return now - sentAt >= RESOLUTION_TIMEOUT_MS;
         }
 
-        long invalidated = invalidatedAtMillis;
-        if (invalidated != 0 && now - invalidated < RESOLUTION_TIMEOUT_MS) {
+        if (rebuildComing) {
             // The library changed and the debounced rebuild has not pushed
             // yet. Hold, so the song starts with the pack it expects.
             return false;
@@ -670,24 +730,94 @@ public class ResourcePackService implements Listener {
         return true;
     }
 
-    /**
-     * Regenerates the pack zip and hash. Phase 3 will call this after song
-     * downloads add custom instruments, then re-push to online players.
-     */
+    /** Serializes builds without holding the HTTP admission or generation lookup locks. */
     public void rebuild() throws IOException {
-        byte[] bytes = buildPackZip();
-        // Hash first, then publish both in a single volatile write.
-        this.pack = new PackData(bytes, sha1Hex(bytes));
+        synchronized (buildLock) {
+            if (refreshSourceCaches.getAndSet(false)) {
+                customSamples.invalidateFiles();
+                plugin.getPlaybackManager().invalidateSampleCaches();
+            }
+            PackData built = buildPackZip();
+            boolean published = false;
+            Path inspection = null;
+            try {
+                if (plugin.isStopping()) throw new IOException("Plugin is stopping");
+                expireGenerations(System.currentTimeMillis());
+                PackData existing;
+                synchronized (generationLock) {
+                    existing = generations.get(built.sha1());
+                    long retained = generations.values().stream().mapToLong(PackData::size).sum();
+                    if (existing == null && (retained + built.size() > GENERATION_BYTES || generations.size() >= 64))
+                        throw new IOException("Pack generation retention budget is full; retry in ten minutes");
+                    publishing = existing;
+                }
+                if (existing != null) {
+                    Files.deleteIfExists(built.file()); built = existing;
+                } else {
+                    Path destination = built.file().resolveSibling(built.sha1() + ".zip");
+                    moveReplacing(built.file(), destination);
+                    built = new PackData(destination, built.size(), built.sha1(), built.events(), built.seconds());
+                }
+                // Independent inspection copy: editing it can never alter a served generation.
+                Path packFile = plugin.getDataFolder().toPath().resolve("resource-pack.zip");
+                inspection = Files.createTempFile(packFile.getParent(), "resource-pack-", ".tmp");
+                Files.copy(built.file(), inspection, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                moveReplacing(inspection, packFile);
+                if (plugin.isStopping()) throw new IOException("Plugin is stopping");
+                synchronized (generationLock) {
+                    generations.putIfAbsent(built.sha1(), built);
+                    advertisedAt.putIfAbsent(built.sha1(), System.currentTimeMillis());
+                    pack = generations.get(built.sha1());
+                    published = true;
+                }
+                plugin.getPlaybackManager().refreshSampleTimings();
+            } finally {
+                synchronized (generationLock) { publishing = null; }
+                if (inspection != null) Files.deleteIfExists(inspection);
+                if (!published && !generations.containsKey(built.sha1())) Files.deleteIfExists(built.file());
+            }
+        }
+    }
 
-        // Written out for server-owner inspection/debugging only
-        Path packFile = plugin.getDataFolder().toPath().resolve("resource-pack.zip");
-        Files.createDirectories(packFile.getParent());
-        Files.write(packFile, bytes);
+    /** Current URLs remain available; open transfers keep their file handle until completion. */
+    private void expireGenerations(long now) throws IOException {
+        synchronized (generationLock) {
+            for (var entry : generations.entrySet()) {
+                if (entry.getValue() == pack || entry.getValue() == publishing
+                        || now - advertisedAt.getOrDefault(entry.getKey(), 0L) < RETENTION_MS) continue;
+                // On platforms that forbid deleting open files, leave the entry and retry next time.
+                try { Files.deleteIfExists(entry.getValue().file()); }
+                catch (IOException e) { continue; }
+                generations.remove(entry.getKey(), entry.getValue());
+                advertisedAt.remove(entry.getKey());
+            }
+        }
+    }
+
+    private static void moveReplacing(Path from, Path to) throws IOException {
+        try { Files.move(from, to, java.nio.file.StandardCopyOption.ATOMIC_MOVE, java.nio.file.StandardCopyOption.REPLACE_EXISTING); }
+        catch (java.nio.file.AtomicMoveNotSupportedException e) {
+            Files.move(from, to, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+        }
+    }
+
+    private Path packDirectory() throws IOException {
+        Path directory = plugin.getDataFolder().toPath().resolve("pack-generations");
+        if (Files.isSymbolicLink(directory)) throw new IOException("Pack generation directory must not be a symlink");
+        Files.createDirectories(directory);
+        if (!storagePrepared) {
+            try (Stream<Path> files = Files.list(directory)) {
+                for (Path file : files.filter(f -> f.getFileName().toString().matches("[0-9a-f]{40}\\.zip|building-.*\\.tmp")).toList()) {
+                    Files.deleteIfExists(file);
+                }
+            }
+            storagePrepared = true;
+        }
+        return directory;
     }
 
     /**
-     * Builds the pack on a worker thread and publishes the result on the main
-     * thread.
+     * Builds and publishes the pack on a worker, then sends it on the main thread.
      *
      * Mirrors what doRebuildAndPush already does for runtime library changes;
      * startup was the one path still doing this work inline.
@@ -696,50 +826,75 @@ public class ResourcePackService implements Listener {
      *                     which matters for /reload and plugin swaps where no
      *                     join event will fire
      */
-    private void buildPackAsync(boolean pushWhenDone) {
-        org.bukkit.Bukkit.getScheduler().runTaskAsynchronously(plugin, () -> {
-            boolean built;
-            try {
-                rebuild();
-                built = true;
-            } catch (Exception e) {
-                plugin.getLogger().severe("Could not generate the resource pack: " + e);
-                built = false;
-            }
-            boolean success = built;
+    private void buildPackAsync(boolean pushWhenDone) { requestRebuild(pushWhenDone); }
 
-            // The plugin can be disabled while this is in flight (a fast
-            // stop, or a reload that swaps it out); scheduling onto a
-            // disabled plugin throws.
-            if (!plugin.isEnabled()) return;
-            org.bukkit.Bukkit.getScheduler().runTask(plugin, () -> {
-                if (!success) return;
-                plugin.getLogger().info("Resource pack generated: "
-                        + plugin.getDataFolder().toPath().resolve("resource-pack.zip")
-                        + " (SHA-1 " + getPackSha1() + ")");
-                if (pushWhenDone && isActive()) {
-                    for (Player online : plugin.getServer().getOnlinePlayers()) {
-                        send(online);
-                    }
-                }
-            });
-        });
+    /** Vanilla sound cache used when an import asks to recover a Minecraft sample. */
+    public VanillaSounds getVanillaSounds() {
+        return vanillaSounds;
     }
 
-    /** Sends the required pack to a player. */
+    /** Sends a pack; only enforced initial join attempts are marked required. */
     public void send(Player player) {
-        PackData current = pack;
-        if (current == null) return;        // nothing built yet
-        // Starts (or restarts) this player's answer window.
-        packSentAtMillis.put(player.getUniqueId(), System.currentTimeMillis());
+        PackData current;
+        synchronized (generationLock) {
+            current = pack;
+            if (current != null) advertisedAt.put(current.sha1(), System.currentTimeMillis());
+        }
+        if (current == null || !isActive() || plugin.isStopping()) return;
+        UUID playerId = player.getUniqueId();
+        String url = publicUrl + "?v=" + current.sha1();
+        Installed existing = installed.get(playerId);
+        if (existing != null && existing.sha1().equals(current.sha1())) {
+            // Withdraw obsolete work before removing it on the client: even a
+            // late terminal status must not replace this installed generation.
+            requestedPackIds.remove(playerId);
+            requestedUrls.remove(playerId);
+            Installed obsolete = requested.remove(playerId);
+            if (obsolete != null && !obsolete.request().equals(existing.request()))
+                player.removeResourcePacks(obsolete.request());
+            // Nothing new reaches the client, so an existing resolution keeps
+            // its time: restarting the settle delay here muted listeners again.
+            if (resolvedAtMillis.containsKey(playerId)) {
+                awaitingInitialPack.remove(playerId); packSentAtMillis.remove(playerId);
+            } else markResolved(playerId);
+            return;
+        }
+        Installed pending = requested.get(playerId);
+        Long sentAt = packSentAtMillis.get(playerId);
+        if (pending != null && pending.sha1().equals(current.sha1())
+                && url.equals(requestedUrls.get(playerId)) && sentAt != null
+                && System.currentTimeMillis() - sentAt < RESOLUTION_TIMEOUT_MS
+                && !packResolved.contains(playerId)) return;
+        UUID requestId = UUID.randomUUID();
+        Installed superseded = requested.put(playerId, new Installed(requestId, current.sha1(), current.events(), current.seconds()));
+        requestedPackIds.put(playerId, requestId);
+        requestedUrls.put(playerId, url);
+        packLoaded.remove(playerId);
+        packResolved.remove(playerId);
+        resolvedAtMillis.remove(playerId);
+        packSentAtMillis.put(playerId, System.currentTimeMillis());
         ResourcePackInfo info = ResourcePackInfo.resourcePackInfo(
-                PACK_ID, URI.create(publicUrl), current.sha1());
+                requestId, URI.create(url), current.sha1());
         player.sendResourcePacks(ResourcePackRequest.resourcePackRequest()
                 .packs(info)
-                .required(true)
+                .required(kickOnRefuse && awaitingInitialPack.contains(playerId))
                 .prompt(plugin.getMessages().get("pack.prompt"))
-                .replace(true)
+                .replace(false)
                 .build());
+        // Withdraw what the new pack replaces only AFTER pushing it. The
+        // client defers its resource reload until pending downloads finish,
+        // so these removals join the single reload that applies the new pack.
+        // Removing the old pack once the new one had loaded (as before) made
+        // the client reload a second time: two loading screens per update.
+        // replace(true) would also do it in one step, but it would remove
+        // packs that belong to the server or to other plugins.
+        if (superseded != null && (existing == null || !superseded.request().equals(existing.request())))
+            player.removeResourcePacks(superseded.request());
+        if (existing != null) {
+            // The client no longer holds it, so it must not count as installed.
+            installed.remove(playerId, existing);
+            player.removeResourcePacks(existing.request());
+        }
     }
 
     // ------------------------------------------------------------------
@@ -748,6 +903,7 @@ public class ResourcePackService implements Listener {
 
     @EventHandler
     public void onJoin(PlayerJoinEvent event) {
+        trackSource(event.getPlayer());
         if (isActive()) {
             awaitingInitialPack.add(event.getPlayer().getUniqueId());
             send(event.getPlayer());
@@ -756,6 +912,11 @@ public class ResourcePackService implements Listener {
 
     @EventHandler
     public void onQuit(PlayerQuitEvent event) {
+        untrackSource(event.getPlayer().getUniqueId());
+        installed.remove(event.getPlayer().getUniqueId());
+        requested.remove(event.getPlayer().getUniqueId());
+        requestedPackIds.remove(event.getPlayer().getUniqueId());
+        requestedUrls.remove(event.getPlayer().getUniqueId());
         packLoaded.remove(event.getPlayer().getUniqueId());
         packResolved.remove(event.getPlayer().getUniqueId());
         resolvedAtMillis.remove(event.getPlayer().getUniqueId());
@@ -765,9 +926,8 @@ public class ResourcePackService implements Listener {
 
     @EventHandler
     public void onPackStatus(PlayerResourcePackStatusEvent event) {
-        if (!isActive()) return;
-
         UUID playerId = event.getPlayer().getUniqueId();
+        if (!event.getID().equals(requestedPackIds.get(playerId))) return;
         // Enforcement applies to the pack sent on JOIN. A later re-push (a
         // song added custom sounds) must never disconnect someone: they did
         // nothing wrong, and otherwise anyone able to download songs could
@@ -776,23 +936,30 @@ public class ResourcePackService implements Listener {
 
         switch (event.getStatus()) {
             case SUCCESSFULLY_LOADED -> {
+                Installed next = requested.get(playerId);
+                if (next == null) return;
+                // The previous generation was withdrawn when this one was
+                // pushed; removing anything here would trigger another reload.
+                installed.put(playerId, next);
                 packLoaded.add(playerId);
                 markResolved(playerId);
             }
             case DECLINED -> {
+                packLoaded.remove(playerId);
                 markResolved(playerId);
                 if (kickOnRefuse && initial) {
                     event.getPlayer().kick(plugin.getMessages().get("pack.kick-refused"));
                 }
             }
             case FAILED_DOWNLOAD, INVALID_URL, FAILED_RELOAD, DISCARDED -> {
-                // Resolve regardless, so the playback start-gate can't hang
+                // Resolve regardless, so the playback start-gate cannot hang.
+                packLoaded.remove(playerId);
                 markResolved(playerId);
                 if (kickOnRefuse && initial) {
                     event.getPlayer().kick(plugin.getMessages().get("pack.kick-failed"));
                 } else if (!initial) {
-                    plugin.getLogger().warning("Resource pack re-push failed for "
-                            + event.getPlayer().getName() + "; they keep the previous pack.");
+                    plugin.getLogger().warning("Resource pack update failed for " + event.getPlayer().getName()
+                            + "; they have no music pack until the next update or until they rejoin.");
                 }
             }
             default -> { /* ACCEPTED / DOWNLOADED: intermediate states */ }
@@ -804,17 +971,18 @@ public class ResourcePackService implements Listener {
     // ------------------------------------------------------------------
 
     /**
-     * Sound event key (without namespace) for a song's custom sound file:
-     * "song.&lt;sanitizedId&gt;.&lt;sanitizedPath&gt;". Playback and pack
-     * generation both derive names through here, so they can never drift.
+     * Sound event key (without namespace) for a song's custom sound file.
+     * Both the song ID and canonical path are SHA-256 digests, so the key is
+     * bounded to the resource-pack namespace and cannot collide with a
+     * generated octave suffix. Playback and generation share this method.
      */
     public static String customSoundEvent(String publicId, String soundFile) {
-        return "song." + sanitizeKeyPart(publicId) + "." + sanitizeKeyPart(soundKeyPart(soundFile));
+        return "song." + digestKey(publicId) + "." + digestKey(soundKeyPart(soundFile)) + ".base";
     }
 
     /**
      * The identifying part of a custom sound path: the whole relative path,
-     * minus the .ogg extension, with separators normalised.
+     * minus the .ogg extension, with separators and dot segments normalised.
      *
      * The directories are deliberately KEPT. NBS v5 lets a song reference
      * sounds in subfolders, so "drums/kick.ogg" and "effects/kick.ogg" are two
@@ -823,9 +991,8 @@ public class ResourcePackService implements Listener {
      * silently -- the song played with one of its instruments missing and
      * nothing said why.
      *
-     * sanitizeKeyPart later turns the separator into an underscore and, since
-     * that transform is lossy, appends a hash of the original. So "drums/kick"
-     * and a literal "drums_kick" stay distinct too.
+     * The complete canonical path is hashed below, so separators and literal
+     * underscores remain distinct without a lossy sanitising transform.
      */
     public static String soundKeyPart(String soundFile) {
         String name = soundFile.replace('\\', '/');
@@ -833,23 +1000,26 @@ public class ResourcePackService implements Listener {
         // two spellings of one path look like different sounds.
         while (name.startsWith("./")) name = name.substring(2);
         while (name.startsWith("/")) name = name.substring(1);
-        if (name.toLowerCase(Locale.ROOT).endsWith(".ogg")) {
-            name = name.substring(0, name.length() - 4);
+        java.util.ArrayDeque<String> segments = new java.util.ArrayDeque<>();
+        for (String segment : name.split("/", -1)) {
+            if (segment.isEmpty() || segment.equals(".")) continue;
+            if (segment.equals("..")) {
+                if (segments.isEmpty()) return ""; // escaped the sounds root
+                segments.removeLast();
+            } else {
+                segments.addLast(segment);
+            }
         }
+        name = String.join("/", segments);
         return name;
     }
 
-    /**
-     * Namespaced keys allow only [a-z0-9_.-]. Lowercase and replace the
-     * rest; if that transform was lossy (uppercase, exotic chars), append
-     * a hash suffix so distinct inputs cannot collide.
-     */
-    public static String sanitizeKeyPart(String input) {
-        String lowered = input.toLowerCase(Locale.ROOT).replaceAll("[^a-z0-9_-]", "_");
-        if (lowered.equals(input)) {
-            return lowered;
-        }
-        return lowered + "-" + Integer.toHexString(input.hashCode());
+    /** Returns the stable digest used for a namespaced key component. */
+    public static String sanitizeKeyPart(String input) { return digestKey(input); }
+    private static String digestKey(String input) {
+        try { return java.util.HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256")
+                .digest(input.getBytes(StandardCharsets.UTF_8))); }
+        catch (java.security.NoSuchAlgorithmException e) { throw new IllegalStateException(e); }
     }
 
     private void markResolved(UUID playerId) {
@@ -864,20 +1034,75 @@ public class ResourcePackService implements Listener {
     // ------------------------------------------------------------------
 
     /**
-     * Resource pack format to declare, matching the client version this server
-     * accepts.
-     *
-     * A server only admits clients of its own version, so one number is right
-     * for everyone connected. It is configurable because the number changes
-     * with every Minecraft release and an admin should not need a plugin
-     * update to move: 84 is 26.1-26.1.2, 88 is 26.2. Players can read their
-     * own with F3+V.
+     * Client resource-pack format (major version) of each Minecraft release
+     * this build knows, used by {@code pack-format: auto}. 26.3 itself reports
+     * 97.1; pack.mcmeta declares the major number, which max_format treats as
+     * "any minor version", so 97 covers 97.0 through 97.x.
      */
-    private int packFormat() {
-        return Math.max(1, plugin.getConfig().getInt("resource-pack.pack-format", 88));
+    static final Map<String, Integer> KNOWN_PACK_FORMATS = Map.of(
+            "26.1", 84, "26.1.1", 84, "26.1.2", 84,
+            "26.2", 88,
+            "26.3", 97);
+    /** Format used by auto when the server version is newer than this table. */
+    static final int LATEST_KNOWN_PACK_FORMAT = 97;
+    private Object lastFormatWarning;
+
+    private static String serverVersion() {
+        try { return org.bukkit.Bukkit.getMinecraftVersion(); }
+        catch (RuntimeException | LinkageError e) { return ""; }
     }
 
-    private byte[] buildPackZip() throws IOException {
+    /**
+     * "auto" (or an absent value) follows the server's own Minecraft version;
+     * a number is used as given, so a proxy that admits other client versions
+     * can still pin the format its players need.
+     */
+    static int resolvePackFormat(Object configured, String serverVersion) {
+        if (configured instanceof Number number) return number.intValue();
+        if (configured == null || configured instanceof String text && text.trim().equalsIgnoreCase("auto")) {
+            return KNOWN_PACK_FORMATS.getOrDefault(serverVersion == null ? "" : serverVersion.trim(),
+                    LATEST_KNOWN_PACK_FORMAT);
+        }
+        throw new IllegalArgumentException("resource-pack.pack-format must be auto or a number");
+    }
+
+    /**
+     * An upgraded server keeps its old config.yml, so a pinned format from the
+     * previous release silently makes every client mark the pack incompatible.
+     * Say so once per distinct setting rather than on every reload.
+     */
+    private void warnAboutPackFormat(Object configured, int format) {
+        String version = serverVersion();
+        Integer expected = KNOWN_PACK_FORMATS.get(version);
+        Object key = configured + "@" + version;
+        if (key.equals(lastFormatWarning)) return;
+        if (configured instanceof Number && expected != null && expected != format) {
+            lastFormatWarning = key;
+            plugin.getLogger().warning("resource-pack.pack-format is " + format + ", but this server runs Minecraft "
+                    + version + " (pack format " + expected + "). Clients on " + version + " will mark the music pack"
+                    + " incompatible. Set pack-format: auto (or " + expected + ") unless a proxy admits other versions.");
+        } else if (!(configured instanceof Number) && expected == null) {
+            lastFormatWarning = key;
+            plugin.getLogger().warning("pack-format: auto does not know Minecraft " + version + "; declaring format "
+                    + format + ". If clients mark the pack incompatible, set resource-pack.pack-format explicitly"
+                    + " (players can read theirs with F3+V).");
+        }
+    }
+
+    /**
+     * Resource pack format to declare, matching the client version this server
+     * accepts: the configured number, or the server version's format for auto.
+     */
+    private int packFormat() {
+        return configuredPackFormat;
+    }
+
+    /** The format currently declared in pack.mcmeta, for /nbw packinfo. */
+    public int getPackFormat() {
+        return configuredPackFormat;
+    }
+
+    private PackData buildPackZip() throws IOException {
         // Only the fields the target client actually reads.
         //
         // This previously wrote pack_format, min_format, max_format AND
@@ -894,19 +1119,42 @@ public class ResourcePackService implements Listener {
         packMeta.put("max_format", format);
         Map<String, Object> mcmeta = Map.of("pack", packMeta);
 
+        buildingSeconds.clear();
         Map<String, Object> sounds = new LinkedHashMap<>();
         java.util.Set<String> events = new java.util.HashSet<>();
 
-        ByteArrayOutputStream buffer = new ByteArrayOutputStream();
-        try (ZipOutputStream zip = new ZipOutputStream(buffer)) {
-            putEntry(zip, "pack.mcmeta", gson.toJson(mcmeta));
-            appendVanillaOctaves(zip, sounds, events);
-            appendCustomSounds(zip, sounds, events);
-            zip.setLevel(java.util.zip.Deflater.DEFAULT_COMPRESSION);  // text again
-            putEntry(zip, "assets/nbw/sounds.json", gson.toJson(sounds));
+        Path temp = Files.createTempFile(packDirectory(), "building-", ".tmp");
+        boolean complete = false;
+        try {
+            MessageDigest digest;
+            try { digest = MessageDigest.getInstance("SHA-1"); }
+            catch (java.security.NoSuchAlgorithmException e) { throw new IllegalStateException(e); }
+            try (OutputStream file = Files.newOutputStream(temp, StandardOpenOption.WRITE, LinkOption.NOFOLLOW_LINKS);
+                 ZipOutputStream zip = new ZipOutputStream(new java.security.DigestOutputStream(new PackOutput(file), digest))) {
+                putEntry(zip, "pack.mcmeta", gson.toJson(mcmeta));
+                appendVanillaOctaves(zip, sounds, events);
+                appendCustomSounds(zip, sounds, events);
+                zip.setLevel(java.util.zip.Deflater.DEFAULT_COMPRESSION);
+                putEntry(zip, "assets/nbw/sounds.json", gson.toJson(sounds));
+            }
+            PackData result = new PackData(temp, Files.size(temp), java.util.HexFormat.of().formatHex(digest.digest()),
+                    Set.copyOf(events), Map.copyOf(buildingSeconds));
+            complete = true;
+            return result;
+        } finally { if (!complete) Files.deleteIfExists(temp); }
+    }
+
+    /** Bounds ZIP output while streaming, including the central directory. */
+    private static final class PackOutput extends java.io.FilterOutputStream {
+        private long written;
+        PackOutput(OutputStream out) { super(out); }
+        private void admit(int count) throws IOException {
+            if (Thread.currentThread().isInterrupted()) throw new java.io.InterruptedIOException("Pack build cancelled");
+            if (count > MAX_PACK_BYTES - written) throw new IOException("Pack exceeds total size budget");
+            written += count;
         }
-        this.generatedEvents = java.util.Set.copyOf(events);
-        return buffer.toByteArray();
+        @Override public void write(int value) throws IOException { admit(1); out.write(value); }
+        @Override public void write(byte[] data, int from, int length) throws IOException { admit(length); out.write(data, from, length); }
     }
 
     /**
@@ -923,58 +1171,22 @@ public class ResourcePackService implements Listener {
         // rebuild for ~0% size gain. Store audio entries uncompressed.
         zip.setLevel(java.util.zip.Deflater.NO_COMPRESSION);
 
-        int available = 0;
+        long remaining = 16L * 1024 * 1024;
         for (String instrument : INSTRUMENT_NAMES) {
-            if (vanillaSounds.get(instrument) != null) available++;
-        }
-
-        List<OctaveEntry> cache = vanillaOctaveCache;
-        if (cache == null || vanillaOctaveSourceCount != available) {
-            cache = generateVanillaOctaves();
-            vanillaOctaveCache = cache;
-            vanillaOctaveSourceCount = available;
-        }
-
-        for (OctaveEntry entry : cache) {
-            zip.putNextEntry(new ZipEntry("assets/nbw/sounds/" + entry.path() + ".ogg"));
-            zip.write(entry.bytes());
-            zip.closeEntry();
-            sounds.put(entry.event(), Map.of("sounds",
-                    java.util.List.of(Map.of("name", "nbw:" + entry.path()))));
-            events.add(entry.event());
-        }
-    }
-
-    /** The slow path: read the vanilla sounds and rate-shift every variant. */
-    private List<OctaveEntry> generateVanillaOctaves() throws IOException {
-        List<OctaveEntry> entries = new java.util.ArrayList<>();
-        java.util.List<String> skipped = new java.util.ArrayList<>();
-        for (String instrument : INSTRUMENT_NAMES) {
-            Path source = vanillaSounds.get(instrument);
-            if (source == null) continue;                 // fold instead
-            byte[] original = Files.readAllBytes(source);
-            if (!OggTools.isOgg(original)) continue;
-
-            for (Map.Entry<String, Integer> variant : OCTAVE_VARIANTS.entrySet()) {
-                byte[] shifted = OggTools.shiftOctaves(original, variant.getValue());
-                if (shifted == null) {                    // rate outside the allowed range
-                    skipped.add(instrument + variant.getKey());
-                    continue;
-                }
+            OggTools.Sample source = vanillaSounds.sample(instrument);
+            if (source == null) continue;
+            for (var variant : OCTAVE_VARIANTS.entrySet()) {
+                if (source.size() > remaining) continue;
+                OggTools.Sample shifted = vanillaSounds.shiftedSample(source, variant.getValue());
+                if (shifted == null) continue;
                 String event = instrument + variant.getKey();
-                entries.add(new OctaveEntry(event, "octaves/" + event, shifted));
+                String path = "octaves/" + event;
+                zip.putNextEntry(zipEntry("assets/nbw/sounds/" + path + ".ogg"));
+                zip.write(shifted.bytes()); zip.closeEntry();
+                addSound(sounds, events, event, path, shifted.seconds());
+                remaining -= shifted.size();
             }
         }
-        if (!entries.isEmpty()) {
-            plugin.getLogger().info("Generated " + entries.size()
-                    + " octave-shifted note block sound(s) (cached for future rebuilds).");
-        }
-        if (!skipped.isEmpty()) {
-            plugin.getLogger().warning(skipped.size() + " octave variant(s) could not be built "
-                    + "(source sample rate out of range): " + String.join(", ", skipped)
-                    + ". Notes needing them fold into the octave below.");
-        }
-        return entries;
     }
 
     /**
@@ -985,121 +1197,82 @@ public class ResourcePackService implements Listener {
      * extension — filtering by "*.ogg" finds nothing. Content is sniffed
      * via the OggS magic bytes instead.
      */
-    private void appendCustomSounds(ZipOutputStream zip, Map<String, Object> sounds,
-                                    java.util.Set<String> events) throws IOException {
-        zip.setLevel(java.util.zip.Deflater.NO_COMPRESSION);   // Ogg: see above
+    private record SharedSound(String path, double seconds) {}
+    private record CustomEntry(String event, Path root, String relative, String digest) {}
+    private void appendCustomSounds(ZipOutputStream zip, Map<String, Object> sounds, Set<String> events) throws IOException {
+        zip.setLevel(java.util.zip.Deflater.NO_COMPRESSION);
         var downloads = plugin.getDownloadManager();
-        if (downloads == null) return;
-
-        long budget = maxCustomSoundBytes;
-        int fileCount = 0;
-        // Minecraft resource packs accept Ogg Vorbis only. NBS 3.12 re-added
-        // .wav custom instruments, so a song can now carry audio we simply
-        // cannot ship -- count it and say so, rather than letting those notes
-        // fall silent with no explanation anywhere.
-        int nonAudio = 0;
-
-        for (String publicId : downloads.getDownloadedIds()) {
-            Path soundsDir = downloads.getSongDirectory(publicId).resolve("sounds");
-            if (!Files.isDirectory(soundsDir)) continue;
-
+        if (downloads == null || maxCustomSoundBytes == 0) return;
+        long budget = Math.min(maxCustomSoundBytes, 64L * 1024 * 1024);
+        List<CustomEntry> admitted = new java.util.ArrayList<>();
+        Set<String> assets = new java.util.HashSet<>();
+        Map<String, SharedSound> shiftedAssets = new java.util.HashMap<>();
+        int invalid = 0, omitted = 0;
+        for (String id : downloads.getDownloadedIds().stream().sorted().toList()) {
+            Path root = downloads.getSongDirectory(id).resolve("sounds");
+            if (!Files.isDirectory(root, LinkOption.NOFOLLOW_LINKS)) continue;
             List<Path> files;
-            try (Stream<Path> walk = Files.walk(soundsDir)) {
-                files = walk.filter(Files::isRegularFile).sorted().toList();
-            }
-
+            try (Stream<Path> walk = Files.walk(root, 16)) {
+                files = walk.filter(f -> Files.isRegularFile(f, LinkOption.NOFOLLOW_LINKS)).sorted().limit(4096).toList();
+            } catch (IOException e) { continue; }
             for (Path file : files) {
-                byte[] bytes;
                 try {
-                    bytes = Files.readAllBytes(file);
-                } catch (IOException e) {
-                    // May be mid-removal on another thread; skip this file
-                    plugin.getLogger().warning("Skipping unreadable pack sound " + file);
-                    continue;
-                }
-                if (!OggTools.isOgg(bytes)) {             // not Ogg Vorbis
-                    nonAudio++;
-                    continue;
-                }
-                if (bytes.length > budget) {
-                    plugin.getLogger().warning("Resource pack custom-sound budget reached; "
-                            + "skipping remaining sounds (raise resource-pack.max-custom-sounds-mb).");
-                    return;
-                }
-                budget -= bytes.length;
-                fileCount++;
-
-                // Relative to the song's sounds folder, so a file in a
-                // subdirectory keeps the directory in its key. Passing only
-                // getFileName() here was what made two same-named files in
-                // different folders collapse onto one event.
-                String relative = soundsDir.relativize(file).toString();
-                String event = customSoundEvent(publicId, relative);
-                String path = "songs/" + sanitizeKeyPart(publicId) + "/"
-                        + sanitizeKeyPart(soundKeyPart(relative));
-
-                // Distinct paths now yield distinct events, so this should no
-                // longer fire; it stays because a duplicate would make
-                // ZipOutputStream throw and kill the entire rebuild.
-                if (!events.add(event)) {
-                    plugin.getLogger().warning("Two custom sounds in " + publicId
-                            + " map to the same event (" + event + "); skipping " + relative);
-                    continue;
-                }
-
-                zip.putNextEntry(new ZipEntry("assets/nbw/sounds/" + path + ".ogg"));
-                zip.write(bytes);
-                zip.closeEntry();
-                sounds.put(event, Map.of("sounds",
-                        java.util.List.of(Map.of("name", "nbw:" + path))));
-
-                for (Map.Entry<String, Integer> variant : OCTAVE_VARIANTS.entrySet()) {
-                    byte[] shifted = OggTools.shiftOctaves(bytes, variant.getValue());
-                    if (shifted == null) continue;
-                    // Octave variants are FULL COPIES (shiftOctaves clones the
-                    // file and rewrites its sample rate), so each sound really
-                    // costs up to 7x its own size. Counting only the original
-                    // let the pack reach ~7x the configured budget -- held in
-                    // memory AND downloaded by every client.
-                    if (shifted.length > budget) {
-                        plugin.getLogger().warning("Resource pack custom-sound budget reached "
-                                + "while adding octave variants; skipping the rest "
-                                + "(raise resource-pack.max-custom-sounds-mb).");
-                        return;
-                    }
-                    budget -= shifted.length;
-                    String variantEvent = event + variant.getKey();
-                    String variantPath = path + variant.getKey();
-                    zip.putNextEntry(new ZipEntry("assets/nbw/sounds/" + variantPath + ".ogg"));
-                    zip.write(shifted);
-                    zip.closeEntry();
-                    sounds.put(variantEvent, Map.of("sounds",
-                            java.util.List.of(Map.of("name", "nbw:" + variantPath))));
-                    events.add(variantEvent);
-                }
+                    if (events.size() >= 8192) { omitted++; continue; }
+                    String relative = root.relativize(file).toString();
+                    Path contained = CustomSoundPaths.resolve(root, relative);
+                    if (contained == null) { invalid++; continue; }
+                    OggTools.Sample sample = customSamples.read(contained);
+                    long cost = assets.contains(sample.digest()) ? 0 : sample.size();
+                    if (cost > budget) { omitted++; continue; }
+                    String event = customSoundEvent(id, relative);
+                    if (events.contains(event)) { invalid++; continue; }
+                    writeSound(zip, sounds, events, assets, event, sample); budget -= cost;
+                    admitted.add(new CustomEntry(event, root, relative, sample.digest()));
+                } catch (IOException e) { invalid++; }
             }
         }
-        if (fileCount > 0) {
-            plugin.getLogger().info("Resource pack includes " + fileCount
-                    + " custom instrument sound(s).");
+        // All fitting base events take priority; identical bytes share one physical ZIP asset.
+        for (CustomEntry entry : admitted) {
+            OggTools.Sample source;
+            try {
+                Path path = CustomSoundPaths.resolve(entry.root(), entry.relative());
+                if (path == null) continue;
+                source = customSamples.read(path);
+                if (!source.digest().equals(entry.digest())) continue; // changed during this build
+            } catch (IOException e) { continue; }
+            for (var variant : OCTAVE_VARIANTS.entrySet()) {
+                if (events.size() >= 8192) { omitted++; continue; }
+                String variantKey = source.digest() + variant.getKey();
+                SharedSound shared = shiftedAssets.get(variantKey);
+                if (shared != null) {
+                    addSound(sounds, events, entry.event() + variant.getKey(), shared.path(), shared.seconds()); continue;
+                }
+                if (source.size() > budget) { omitted++; continue; }
+                OggTools.Sample shifted = customSamples.shift(source, variant.getValue());
+                if (shifted == null) continue;
+                long cost = assets.contains(shifted.digest()) ? 0 : shifted.size();
+                if (cost > budget) { omitted++; continue; }
+                writeSound(zip, sounds, events, assets, entry.event() + variant.getKey(), shifted); budget -= cost;
+                shiftedAssets.put(variantKey, new SharedSound("custom/" + shifted.digest(), shifted.seconds()));
+            }
         }
-        if (nonAudio > 0) {
-            // Names the cause explicitly: otherwise this looks like the plugin
-            // losing sounds, when the file simply is not a format Minecraft
-            // can play.
-            plugin.getLogger().warning(nonAudio + " custom instrument file(s) were skipped"
-                    + " because they are not Ogg Vorbis. Minecraft resource packs support"
-                    + " Ogg only, so notes using them will be silent. Note Block Studio 3.12"
-                    + " allows .wav custom instruments; re-save those sounds as .ogg.");
-        }
+        if (invalid > 0 || omitted > 0) plugin.getLogger().warning("Pack audio: " + invalid
+                + " invalid/unreadable files, " + omitted + " files or variants excluded by budget");
     }
 
-    /**
-     * Call after the song library changes in a way that affects the pack
-     * (a download brought custom sounds). Rebuilds off-thread, then
-     * re-pushes to everyone online — clearing resolution state so the
-     * playback start-gate naturally waits for clients to finish reloading.
-     */
+    private void writeSound(ZipOutputStream zip, Map<String, Object> sounds, Set<String> events,
+                            Set<String> assets, String event, OggTools.Sample sample) throws IOException {
+        String path = "custom/" + sample.digest();
+        if (assets.add(sample.digest())) {
+            zip.putNextEntry(zipEntry("assets/nbw/sounds/" + path + ".ogg")); zip.write(sample.bytes()); zip.closeEntry();
+        }
+        addSound(sounds, events, event, path, sample.seconds());
+    }
+    private void addSound(Map<String, Object> sounds, Set<String> events, String event, String path, double seconds) {
+        sounds.put(event, Map.of("sounds", List.of(Map.of("name", "nbw:" + path))));
+        events.add(event); buildingSeconds.put(event, seconds);
+    }
+
     /**
      * Call after a custom-sound song is REMOVED.
      *
@@ -1110,83 +1283,61 @@ public class ResourcePackService implements Listener {
      * Lenient mode: quiet rebuild only; new joiners get the lean pack,
      * online players keep a harmless superset until the next push.
      */
-    public void onLibraryShrunk() {
-        if (repushOnRemove && isActive()) {
-            onLibraryChanged();
-            return;
+    public void onLibraryShrunk() { requestRebuild(repushOnRemove && isActive()); }
+    public void onLibraryChanged() { requestRebuild(isActive()); }
+    private final java.util.concurrent.atomic.AtomicLong libraryRevision = new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicBoolean pushPending = new java.util.concurrent.atomic.AtomicBoolean();
+    private void requestRebuild(boolean push) {
+        if (plugin.isStopping()) return;
+        libraryRevision.incrementAndGet();
+        if (push) {
+            // Starts are held by the invalidation timestamp alone (see
+            // settled()); keeping each player's resolution lets songs that are
+            // already playing continue while the pack is rebuilt.
+            pushPending.set(true); invalidatedAtMillis = System.currentTimeMillis();
         }
-        org.bukkit.Bukkit.getScheduler().runTaskAsynchronously(plugin, () -> {
-            try {
-                rebuild();
-            } catch (IOException e) {
-                plugin.getLogger().warning("Resource pack rebuild after removal failed: " + e);
-            }
-        });
-    }
-
-    public void onLibraryChanged() {
-        if (!isActive()) return;
-
-        // Invalidate IMMEDIATELY (synchronously), before the rebuild is even
-        // scheduled: from this instant every client's pack is stale, so the
-        // playback start-gate must hold songs until the new pack resolves.
-        // Clearing this only after the async rebuild would leave a window in
-        // which a song could start against the old pack.
-        packLoaded.clear();
-        packResolved.clear();
-        resolvedAtMillis.clear();
-        invalidatedAtMillis = System.currentTimeMillis();
-
-        // Coalesce bursts (e.g. several songs downloaded back to back) into a
-        // single rebuild + re-push, so players don't eat a client reload per
-        // song. The start-gate already holds playback while we wait.
         if (!rebuildPending.compareAndSet(false, true)) return;
-        org.bukkit.Bukkit.getScheduler().runTaskLater(plugin,
-                () -> { rebuildPending.set(false); doRebuildAndPush(); },
-                Math.max(0, rebuildDebounceTicks));
+        org.bukkit.Bukkit.getScheduler().runTaskLater(plugin, this::doRebuildAndPush, rebuildDebounceTicks);
     }
-
     private void doRebuildAndPush() {
-        org.bukkit.Bukkit.getScheduler().runTaskAsynchronously(plugin, () -> {
-            try {
-                rebuild();
-            } catch (IOException e) {
-                // Do NOT return: onLibraryChanged already cleared everyone's
-                // resolution, so bailing out here left every online player
-                // unable to hear anything. rebuild() publishes the new pack
-                // only after building it successfully, so `pack` still holds
-                // the last good one -- push that instead, and clients resolve
-                // against a pack that works even though it lacks the newest
-                // song's sounds.
-                plugin.getLogger().warning("Resource pack rebuild failed: " + e
-                        + "; re-sending the previous pack so players are not left silent.");
-            }
-            org.bukkit.Bukkit.getScheduler().runTask(plugin, () -> {
-                for (Player online : plugin.getServer().getOnlinePlayers()) {
-                    send(online);
+        long revision = libraryRevision.get();
+        boolean push = pushPending.getAndSet(false);
+        plugin.getWorkPool().run(() -> {
+            try { rebuild(); }
+            catch (Exception e) { throw new java.util.concurrent.CompletionException(e); }
+        }).whenComplete((unused, error) -> {
+            if (plugin.isStopping()) return;
+            // Admission failure means the build never ran. Pushing the previous
+            // generation and forgetting the change left a newly added song's
+            // custom sounds out of the pack until some later library change.
+            boolean busy = io.github.noteblockworldmc.util.Throwables.rootCause(error)
+                    instanceof java.util.concurrent.RejectedExecutionException;
+            plugin.runMain(() -> {
+                rebuildPending.set(false);
+                if (busy) {
+                    if (push) pushPending.set(true);
+                    plugin.getLogger().warning("Pack rebuild deferred because the plugin's workers are busy; retrying shortly.");
+                    if (rebuildPending.compareAndSet(false, true))
+                        org.bukkit.Bukkit.getScheduler().runTaskLater(plugin, this::doRebuildAndPush, Math.max(20L, rebuildDebounceTicks));
+                    return;
                 }
+                invalidatedAtMillis = 0;
+                if (error != null) plugin.getLogger().warning("Pack build failed; previous generation retained: " + error);
+                if (push && isActive()) for (Player online : plugin.getServer().getOnlinePlayers()) send(online);
+                if (revision != libraryRevision.get()) requestRebuild(pushPending.get());
             });
         });
     }
 
+    private static ZipEntry zipEntry(String path) {
+        ZipEntry entry = new ZipEntry(path); entry.setTime(0); return entry;
+    }
+
     private static void putEntry(ZipOutputStream zip, String path, String content)
             throws IOException {
-        zip.putNextEntry(new ZipEntry(path));
+        zip.putNextEntry(zipEntry(path));
         zip.write(content.getBytes(StandardCharsets.UTF_8));
         zip.closeEntry();
     }
 
-    private static String sha1Hex(byte[] bytes) {
-        try {
-            byte[] digest = MessageDigest.getInstance("SHA-1").digest(bytes);
-            StringBuilder hex = new StringBuilder(digest.length * 2);
-            for (byte b : digest) {
-                hex.append(Character.forDigit((b >> 4) & 0xF, 16))
-                        .append(Character.forDigit(b & 0xF, 16));
-            }
-            return hex.toString();
-        } catch (Exception e) {
-            throw new IllegalStateException("SHA-1 unavailable", e);
-        }
-    }
 }

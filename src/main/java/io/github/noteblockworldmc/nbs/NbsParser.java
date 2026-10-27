@@ -17,7 +17,7 @@ import java.util.TreeMap;
 
 /**
  * Parser for the .nbs (Note Block Studio) binary format.
- * Supports the classic format (version 0) and OpenNBS versions 1-5.
+ * Supports the classic format (version 0) and OpenNBS versions 1-6.
  * Format reference: https://opennbs.org/nbs
  *
  * All multi-byte values in NBS are little-endian; DataInputStream is
@@ -28,8 +28,8 @@ import java.util.TreeMap;
  *  - transposed by octaves into the note block range (keys 33-57,
  *    F#3-F#5), then pitch = 2^((key-45)/12)
  *  - volume = note velocity% x layer volume%
- * Notes using custom instruments are counted and skipped: the server
- * cannot play arbitrary .ogg files without a resource pack.
+ * Custom notes with valid definitions are retained for resource-pack playback;
+ * missing definitions are counted separately. Tempo/stopper markers are not audio.
  */
 public final class NbsParser {
 
@@ -59,12 +59,15 @@ public final class NbsParser {
     }
 
     public static NbsSong parse(Path file) throws IOException {
+        if (file == null) throw new IOException("No NBS file was supplied");
+        if (Files.isSymbolicLink(file)) throw new IOException("NBS file must not be a symlink");
         try (InputStream in = new BufferedInputStream(Files.newInputStream(file))) {
             return parse(in);
         }
     }
 
     public static NbsSong parse(InputStream rawIn) throws IOException {
+        if (rawIn == null) throw new IOException("No NBS stream was supplied");
         DataInputStream in = new DataInputStream(rawIn);
 
         // ---- Header ----
@@ -251,7 +254,7 @@ public final class NbsParser {
                 if (vanilla >= 0) {
                     promotedCustoms.put(firstCustomIndex + i, vanilla);
                     customSoundFiles.add("");
-                    customKeys.add(45);
+                    customKeys.add(soundKey <= 87 ? soundKey : 45);
                     continue;
                 }
                 customSoundFiles.add(soundFile == null ? "" : soundFile.trim());
@@ -269,12 +272,12 @@ public final class NbsParser {
         TreeMap<Integer, Double> tempoChanges = new TreeMap<>();
         int skippedCustom = 0;
         int skippedDense = 0;
-        int customNoteCount = 0;
         int mergedNotes = 0;
 
         for (RawNote raw : rawNotes) {
             int instrument = raw.instrument();
             int customIndex = -1;
+            int promotedTuning = 0;
             if (tempoChangerInstruments.contains(instrument)) {
                 // Note pitch encodes the new tempo: abs(pitch)/15 = t/s.
                 // Notes are read in ascending layer order, so plain overwrite
@@ -299,6 +302,7 @@ public final class NbsParser {
             if (instrument >= firstCustomIndex) {
                 Integer promoted = promotedCustoms.get(instrument);
                 if (promoted != null) {
+                    promotedTuning = customKeys.get(instrument - firstCustomIndex) - 45;
                     instrument = promoted;
                 } else {
                     int index = instrument - firstCustomIndex;
@@ -321,7 +325,9 @@ public final class NbsParser {
             float volume = clamp((raw.velocity() / 100f) * (layerVolume / 100f), 0f, 1f);
             if (volume <= 0f) continue;
 
-            double effectiveKey = raw.key() + raw.finePitch() / 100.0;
+            // A promoted trumpet uses the vanilla sample's reference key,
+            // so apply its original custom tuning before octave folding.
+            double effectiveKey = raw.key() + raw.finePitch() / 100.0 + promotedTuning;
             // Fold into the base window (vanilla 33-57, or +-12 around a
             // custom instrument's own key), remembering how far we moved:
             // the octave offset selects the extended-pack sound variant.
@@ -340,13 +346,23 @@ public final class NbsParser {
             double minKey = customIndex >= 0 ? baseKey - 12 : MIN_KEY;
             double maxKey = customIndex >= 0 ? baseKey + 12 : MAX_KEY;
             int octave = 0;
-            while (effectiveKey < minKey) { effectiveKey += 12; octave--; }
-            while (effectiveKey > maxKey) { effectiveKey -= 12; octave++; }
+            // Do the fold arithmetically. A hostile fine-pitch value can be
+            // close to the signed-short limit; walking one octave at a time
+            // would turn every such note into thousands of loop iterations
+            // (and a million-note file into a CPU denial of service).
+            if (effectiveKey < minKey) {
+                int shifts = (int) Math.ceil((minKey - effectiveKey) / 12.0);
+                effectiveKey += shifts * 12.0;
+                octave -= shifts;
+            } else if (effectiveKey > maxKey) {
+                int shifts = (int) Math.ceil((effectiveKey - maxKey) / 12.0);
+                effectiveKey -= shifts * 12.0;
+                octave += shifts;
+            }
             // The pack ships +-3 octaves (full 88-key piano); fine-pitch
             // abuse beyond that stays folded at the clamped variant.
             octave = Math.max(-3, Math.min(3, octave));
             float pitch = (float) Math.pow(2, (effectiveKey - baseKey) / 12.0);
-            if (customIndex >= 0) customNoteCount++;
 
             // Panning: note and layer are both 0-200 with 100 = centre.
             // Matches Note Block World's resolvePanning(): a centred layer
@@ -365,7 +381,7 @@ public final class NbsParser {
             // louder. Identical samples at identical pitch are coherent, so
             // their amplitudes add: one note at the summed volume sounds the
             // same and costs ONE of the client's ~250 sound channels instead
-            // of several. Lossless, and often halves a layered song's voices.
+            // of several. Summed volume is capped at 1.0.
             int duplicate = -1;
             for (int i = 0; i < tickNotes.size(); i++) {
                 PlayableNote other = tickNotes.get(i);
@@ -402,7 +418,7 @@ public final class NbsParser {
         if (loopStartTick < 0 || loopStartTick >= lengthTicks) loopStartTick = 0;
 
         return new NbsSong(displayName, displayAuthor, tempo, lengthTicks,
-                notesByTick, skippedCustom, skippedDense, customNoteCount, mergedNotes,
+                notesByTick, skippedCustom, skippedDense, mergedNotes,
                 java.util.List.copyOf(customSoundFiles), tempoChanges,
                 loopEnabled, maxLoopCount, loopStartTick);
     }

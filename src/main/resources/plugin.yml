@@ -1,16 +1,12 @@
 name: NoteblockWorldMC
 version: '${project.version}'
 main: io.github.noteblockworldmc.NoteblockWorldMCPlugin
-api-version: '26.1'
+api-version: '26.3'
 description: Browse, download, and play noteblock.world songs with note block sounds
 
-commands:
-  nbw:
-    description: Browse, download, and play songs from noteblock.world
-    usage: |
-      /nbw help - list the commands you can use
-      /nbw - open the song browser GUI
-      /nbw volume [0-100] - view or set your music volume
+# /nbw is registered in code through Paper's Brigadier command API
+# (JavaPlugin#registerCommand); the plugin.yml command path is obsolete since
+# Paper 26.3, so it is intentionally not declared here.
 
 permissions:
   noteblockworldmc.importurl:

@@ -45,7 +45,7 @@ public class GuiListener implements Listener {
         if (event.getClickedInventory() != event.getView().getTopInventory()) {
             return;
         }
-        if (!MEANINGFUL_CLICKS.contains(event.getClick())) {
+        if (!gui.isOwner(event.getWhoClicked().getUniqueId()) || !MEANINGFUL_CLICKS.contains(event.getClick())) {
             return;
         }
         gui.handleClick(event.getRawSlot(), event.getClick());

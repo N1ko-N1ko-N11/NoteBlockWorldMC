@@ -20,18 +20,9 @@ import java.util.Map;
  * worth changing from in game, because every one of them is audible on the very
  * next note, so an admin can tune by ear while a song plays.
  *
- * <p>Everything else is edited in config.yml. Two different reasons:
- * <ul>
- *   <li>Startup-only values -- a bound socket port, the HTTP client's timeouts,
- *       the API base URL -- would appear to change while doing nothing.</li>
- *   <li>Resource-pack values are re-read at runtime but nothing retroactive
- *       happens; they only affect the next rebuild, push, refusal or removal.
- *       A command that reports success while the pack is unchanged invites
- *       confusion, so they stay a file edit.</li>
- * </ul>
- *
- * <p>Either way the setting is absent from the registry rather than listed as
- * unsupported, so {@code /nbw config} only ever shows what it can actually do.
+ * <p>Other settings are edited in config.yml and applied with /nbw reload.
+ * Pack changes may rebuild audio, re-push resources, or rebind its HTTP server;
+ * this editor stays focused on playback controls that can be tuned by ear.
  *
  * <p>Writes edit a single line in place. Bukkit's {@code saveConfig()} would
  * serialise the whole tree from memory, and this file's comments carry most of
@@ -90,6 +81,7 @@ public final class ConfigEditor {
         // command's own sanity check, since a chord cannot exceed the parser's
         // 128-notes-per-tick cap anyway.
         add("playback.limiter-threshold", Kind.INTEGER, 2, 128, "");
+        add("playback.audible-floor", Kind.DECIMAL, 0, 1, "");
         add("playback.fade-out-ms", Kind.INTEGER, 0, 5000, "");
         add("playback.voice-allocation", Kind.BOOLEAN, 0, 1, "");
         add("playback.client-channels", Kind.INTEGER, 16, 8192, "");
@@ -338,7 +330,7 @@ public final class ConfigEditor {
     // ------------------------------------------------------------------
 
     /**
-     * Replaces one setting's value, leaving every other byte of the file alone.
+     * Replaces one setting's line while preserving surrounding settings and comments.
      *
      * Written to a sibling temp file and moved into place, so a crash midway
      * cannot leave a half-written config.yml -- the plugin would refuse to load

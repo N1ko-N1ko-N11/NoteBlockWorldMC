@@ -16,6 +16,8 @@ public class SongPage {
     @SerializedName("content")
     private List<SongPreview> content;
 
+    private transient volatile List<SongPreview> usableContent;
+
     @SerializedName("page")
     private int page;
 
@@ -28,7 +30,7 @@ public class SongPage {
     /** Builds a page from local library data (downloaded songs). */
     public static SongPage of(List<SongPreview> content, int page, int limit, int total) {
         SongPage songPage = new SongPage();
-        songPage.content = List.copyOf(content);   // immutable snapshot
+        songPage.content = content == null ? List.of() : new java.util.ArrayList<>(content);
         songPage.page = page;
         songPage.limit = limit;
         songPage.total = total;
@@ -36,7 +38,15 @@ public class SongPage {
     }
 
     public List<SongPreview> getContent() {
-        return content != null ? content : Collections.emptyList();
+        List<SongPreview> result = usableContent;
+        if (result == null) {
+            // Gson can supply null elements and previews with missing/invalid IDs.
+            // Cache one immutable, filtered snapshot shared by rendering and clicks.
+            result = content == null ? Collections.emptyList() : content.stream()
+                    .filter(song -> song != null && song.hasValidPublicId()).toList();
+            usableContent = result;
+        }
+        return result;
     }
 
     public int getPage() {

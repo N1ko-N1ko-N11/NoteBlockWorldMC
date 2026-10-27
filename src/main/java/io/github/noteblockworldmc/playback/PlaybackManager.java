@@ -3,7 +3,6 @@ package io.github.noteblockworldmc.playback;
 import io.github.noteblockworldmc.NoteblockWorldMCPlugin;
 import io.github.noteblockworldmc.nbs.NbsParser;
 import io.github.noteblockworldmc.nbs.NbsSong;
-import io.github.noteblockworldmc.nbs.PlayableNote;
 import io.github.noteblockworldmc.pack.ResourcePackService;
 import io.github.noteblockworldmc.util.Throwables;
 import net.kyori.adventure.text.Component;
@@ -103,6 +102,78 @@ public class PlaybackManager implements Listener {
     }
 
     private final NoteblockWorldMCPlugin plugin;
+    public record PlayRequest(UUID token, UUID caller, UUID listener, boolean broadcast) {}
+    private final Map<UUID, PlayRequest> playRequests = new ConcurrentHashMap<>();
+    private volatile PlayRequest broadcastRequest;
+    private static final class PendingSelection {
+        final PlayRequest request;
+        final String songId;
+        volatile boolean invalidated;
+        PendingSelection(PlayRequest request, String songId) { this.request = request; this.songId = songId; }
+    }
+    /** Only not-yet-started library selections; one per personal slot and one broadcast. */
+    private final Map<Object, PendingSelection> pendingSelections = new ConcurrentHashMap<>();
+    private static Object selectionKey(PlayRequest request) { return request.broadcast() ? "broadcast" : request.listener(); }
+    private record InspectionOwner(UUID id) {}
+    private record LoadCallback(String id, UUID token, Player feedback, Consumer<NbsSong> accept) {}
+    private record SongLoad(UUID token, CompletableFuture<NbsSong> future) {}
+    private final Map<Object, LoadCallback> loadCallbacks = new ConcurrentHashMap<>();
+    private final Map<String, SongLoad> loadingSongs = new ConcurrentHashMap<>();
+    private final java.util.concurrent.locks.ReentrantLock driverLock = new java.util.concurrent.locks.ReentrantLock();
+    private volatile long clockGeneration;
+    private record Voice(long end, Object owner, boolean broadcast, Object sound) {}
+    private static final class Voices {
+        final java.util.PriorityQueue<Voice> ends = new java.util.PriorityQueue<>(
+                java.util.Comparator.comparingLong(Voice::end));
+        void expire(long now) { while (!ends.isEmpty() && ends.peek().end() <= now) ends.poll(); }
+    }
+    private final Map<UUID, Voices> listenerVoices = new ConcurrentHashMap<>();
+
+    /** Starts intent BEFORE download/parse; every continuation retains this identity. Main thread. */
+    public PlayRequest beginPlay(Player caller, Player listener, boolean broadcast) {
+        PlayRequest request = new PlayRequest(UUID.randomUUID(), caller.getUniqueId(),
+                broadcast ? null : listener.getUniqueId(), broadcast);
+        pendingSelections.remove(selectionKey(request));
+        if (broadcast) { loadCallbacks.remove("broadcast"); broadcastRequest = request; cancelPendingBroadcast(); queuedBroadcastStart = null; }
+        else { loadCallbacks.remove(request.listener()); playRequests.put(request.listener(), request); cancelPending(request.listener()); queuedStarts.remove(request.listener()); }
+        return request;
+    }
+    public boolean isCurrent(PlayRequest request) {
+        if (plugin.isStopping() || request == null || !(request.broadcast()
+                ? request.equals(broadcastRequest) : request.equals(playRequests.get(request.listener())))) return false;
+        Player caller = plugin.getServer().getPlayer(request.caller());
+        Player listener = request.broadcast() ? caller : plugin.getServer().getPlayer(request.listener());
+        return caller != null && caller.isOnline() && listener != null && listener.isOnline()
+                && caller.hasPermission("noteblockworldmc.play")
+                && (!(request.broadcast() || !request.caller().equals(request.listener()))
+                    || caller.hasPermission("noteblockworldmc.broadcast"));
+    }
+    public void playDownloaded(PlayRequest request, Player feedback, String id) {
+        if (!isCurrent(request)) return;
+        synchronized (songCache) {
+            pendingSelections.put(selectionKey(request), new PendingSelection(request, id));
+        }
+        loadSong(id, feedback, request.broadcast() ? "broadcast" : request.listener(), song -> {
+            if (!isCurrent(request) || !plugin.getDownloadManager().isDownloaded(id)) return;
+            if (request.broadcast()) startBroadcastRequested(feedback, song, id, request);
+            else startRequested(plugin.getServer().getPlayer(request.listener()), song, id, request);
+        });
+    }
+    /**
+     * Releases a selection whose download failed before playback could start.
+     * Without this the request stayed registered, so a later stop reported
+     * stopping a song that never existed. A newer selection is unaffected.
+     */
+    public void abandon(PlayRequest request) {
+        if (request != null) completeRequest(request);
+    }
+    private void completeRequest(PlayRequest request) {
+        pendingSelections.computeIfPresent(selectionKey(request), (key, selection) ->
+                selection.request.equals(request) ? null : selection);
+        if (request.broadcast()) { if (request.equals(broadcastRequest)) broadcastRequest = null; }
+        else playRequests.remove(request.listener(), request);
+    }
+
     private volatile boolean showActionBar;
     private volatile int barLength;
     private volatile boolean respectLoop;
@@ -111,6 +182,8 @@ public class PlaybackManager implements Listener {
     /** Soft limiter: scales dense chords down to keep the client mixer clean. */
     private volatile boolean softLimiter;
     private volatile int limiterThreshold;
+    /** Minimum effective note volume sent to a client. */
+    private volatile float audibleFloor;
     /**
      * Shared high-resolution clock. Minecraft's scheduler only runs 20x a
      * second, so tick-driven playback quantises every note to a 50 ms grid —
@@ -123,24 +196,18 @@ public class PlaybackManager implements Listener {
      */
     private java.util.concurrent.ScheduledExecutorService clock;
     /**
-     * A note below this contributes nothing audible, but still seizes one of
-     * the client's ~250 sound channels for its whole sample -- evicting notes
-     * you CAN hear. Not worth the channel.
+     * Default minimum effective note volume. Zero keeps every nonzero NBS note
+     * eligible for playback; raise it on a busy server to save sound channels.
      */
-    private static final float AUDIBLE_FLOOR = 0.02f;
+    public static final float DEFAULT_AUDIBLE_FLOOR = 0f;
 
-    /**
-     * Voice allocation: keeps the number of simultaneously RINGING sounds
-     * this session asks of the client under a ceiling.
-     *
-     * The client has ~250 sound channels for the whole game, and a note holds
-     * one for its full sample duration, not just its onset. When the pool
-     * overflows, the client evicts sounds arbitrarily — possibly the melody,
-     * possibly footsteps. Tracking occupancy with MEASURED ring times (read
-     * from each sample's Ogg granule position) lets us trim the quietest
-     * notes of a chord only when genuinely near the ceiling, so sparse songs
-     * are never touched and dense ones degrade deliberately.
-     */
+    /** Reads and bounds the quiet-note filter shared by playback and analysis. */
+    public static float configuredAudibleFloor(NoteblockWorldMCPlugin plugin) {
+        double configured = plugin.getConfig().getDouble("playback.audible-floor", DEFAULT_AUDIBLE_FLOOR);
+        if (!Double.isFinite(configured)) return DEFAULT_AUDIBLE_FLOOR;
+        return (float) Math.max(0d, Math.min(1d, configured));
+    }
+
     /**
      * Milliseconds spent ramping down when a song is stopped; 0 = hard cut.
      *
@@ -150,8 +217,13 @@ public class PlaybackManager implements Listener {
      * the remainder: notes already ringing decay on their own. Ramp plus
      * natural decay together give a smooth tail. Cutting at the end of the
      * ramp instead — as this first did — merely delayed a hard cut.
-     */
+    */
     private volatile int fadeOutMs;
+    /**
+     * Keeps the number of simultaneously ringing sounds this session asks of
+     * the client under a ceiling. Measured sample lengths let dense songs
+     * degrade deliberately while sparse songs remain untouched.
+     */
     private volatile boolean voiceAllocation;
     private volatile int voiceCeiling;
 
@@ -190,7 +262,6 @@ public class PlaybackManager implements Listener {
     private final Map<UUID, Playback> sessions = new ConcurrentHashMap<>();
     /** The single server-wide broadcast session, or null. Main thread only. */
     private volatile Playback broadcastSession;
-    /** Pack-resolution waits pending before personal playback starts. */
     /**
      * Songs waiting for the current one to finish fading out.
      *
@@ -203,22 +274,15 @@ public class PlaybackManager implements Listener {
     private final Map<UUID, org.bukkit.scheduler.BukkitTask> pendingStarts = new ConcurrentHashMap<>();
     /** Pack-resolution wait pending before a broadcast starts. Main thread only. */
     private org.bukkit.scheduler.BukkitTask pendingBroadcast;
+    /** Latest broadcast selection, started by the outgoing session's completed fade. */
+    private Runnable queuedBroadcastStart;
     /** Give-up threshold for pack waits: start anyway after 60s. */
     private static final int PACK_WAIT_TIMEOUT_TICKS = 20 * 60;
 
     /** Measured ring time of each vanilla instrument's sample; -1 unknown. */
     private volatile double[] vanillaRingCache;
-    /** Measured ring times of a song's custom sounds, by publicId. */
-    private final Map<String, double[]> customRingCache = new ConcurrentHashMap<>();
-
-    /** Small LRU cache of parsed songs (parsing re-reads the file otherwise). */
-    private final Map<String, NbsSong> songCache =
-            java.util.Collections.synchronizedMap(new LinkedHashMap<>(16, 0.75f, true) {
-                @Override
-                protected boolean removeEldestEntry(Map.Entry<String, NbsSong> eldest) {
-                    return size() > 16;
-                }
-            });
+    /** Active songs stay owned by sessions; retained idle songs have a separate 64 MiB budget. */
+    private final SongCache songCache = new SongCache(64L * 1024 * 1024, 16);
 
     public PlaybackManager(NoteblockWorldMCPlugin plugin) {
         this.plugin = plugin;
@@ -265,6 +329,7 @@ public class PlaybackManager implements Listener {
                 config.getDouble("playback.pan-distance", 2.0)));
         this.softLimiter = config.getBoolean("playback.soft-limiter", true);
         this.limiterThreshold = Math.max(2, config.getInt("playback.limiter-threshold", 8));
+        this.audibleFloor = configuredAudibleFloor(plugin);
 
         boolean wasHighPrecision = this.highPrecision;
         int wasPrecisionMs = this.precisionMs;
@@ -290,35 +355,9 @@ public class PlaybackManager implements Listener {
         }
     }
 
-    /**
-     * The listener's "right" direction, from yaw alone.
-     *
-     * The obvious direction x UP cross product collapses to a zero vector
-     * when a player looks straight up or down — normalising that yields NaN
-     * coordinates, which would then be handed to playSound. Deriving it from
-     * yaw is always unit length, and keeps the stereo field horizontal
-     * (panning shouldn't tilt when someone glances at the sky).
-     */
-    private static org.bukkit.util.Vector rightVector(float yaw) {
-        double radians = Math.toRadians(yaw);
-        return new org.bukkit.util.Vector(-Math.cos(radians), 0, -Math.sin(radians));
-    }
-
-    /**
-     * Volume correction for panned notes.
-     *
-     * Minecraft attenuates sound with distance (audible radius ~16 blocks),
-     * so a note emitted 2 blocks to the side arrives noticeably quieter than
-     * a centred one — which would leave every stereo song with a lopsided
-     * mix. Scale the volume back up by the attenuation the offset costs.
-     */
-    private float panVolumeCompensation(org.bukkit.util.Vector right, float pan) {
-        if (right == null || pan == 0f) return 1f;
-        double distance = Math.abs(pan) * panDistance;
-        double remaining = 1.0 - distance / 16.0;
-        if (remaining <= 0.05) return 2f;          // shouldn't happen; stay sane
-        return (float) Math.min(2.0, 1.0 / remaining);
-    }
+    /** Movement prediction is capped: beyond this a note would land far from a player who stopped. */
+    private static final double MAX_LEAD_SECONDS = 0.6, MAX_LEAD_BLOCKS = 4, TELEPORT_BLOCKS = 10;
+    private static final double[] NO_MOTION = {0, 0, 0};
 
     /** Starts the shared clock on first use. */
     private synchronized void ensureClock() {
@@ -328,12 +367,15 @@ public class PlaybackManager implements Listener {
             thread.setDaemon(true);
             return thread;
         });
-        clock.scheduleAtFixedRate(this::clockStep, 0, precisionMs,
+        long generation = ++clockGeneration;
+        clock.scheduleAtFixedRate(() -> clockStep(generation), 0, precisionMs,
                 java.util.concurrent.TimeUnit.MILLISECONDS);
     }
 
-    private void clockStep() {
+    private void clockStep(long generation) {
+        if (!driverLock.tryLock()) return;
         try {
+            if (generation != clockGeneration || !highPrecision || plugin.isStopping()) return;
             for (Playback session : sessions.values()) {
                 session.step();
             }
@@ -342,11 +384,12 @@ public class PlaybackManager implements Listener {
         } catch (Throwable t) {
             // A clock thread that dies takes all music with it
             plugin.getLogger().warning("Playback clock error: " + t);
-        }
+        } finally { driverLock.unlock(); }
     }
 
     /** Stops the clock; call on plugin disable. */
     public synchronized void shutdownClock() {
+        ++clockGeneration;
         if (clock != null) {
             clock.shutdownNow();
             clock = null;
@@ -355,7 +398,7 @@ public class PlaybackManager implements Listener {
 
     /**
      * Stops the clock when nothing is playing. Without this it keeps waking
-     * every precision-ms (200x/second at the default) to iterate an empty
+     * every precision-ms (500x/second at the default) to iterate an empty
      * session map until the next song or server shutdown — needless wakeups
      * costing a little CPU and battery-unfriendly timer pressure for zero
      * work. ensureClock() restarts it on the next play. Main thread only;
@@ -422,12 +465,12 @@ public class PlaybackManager implements Listener {
 
     /** Parses (off-thread, cached) and plays a downloaded song for one player. */
     public void playDownloaded(Player player, String publicId) {
-        loadSong(publicId, player, song -> start(player, song, publicId));
+        playDownloaded(beginPlay(player, player, false), player, publicId);
     }
 
     /** Parses (off-thread, cached) and broadcasts a downloaded song to everyone. */
     public void playDownloadedForAll(Player starter, String publicId) {
-        loadSong(publicId, starter, song -> startBroadcast(starter, song, publicId));
+        playDownloaded(beginPlay(starter, null, true), starter, publicId);
     }
 
     /** Starts personal playback of an unidentified song (no custom sounds). */
@@ -441,6 +484,11 @@ public class PlaybackManager implements Listener {
      * sounds; pass null for songs outside the library.
      */
     public void start(Player player, NbsSong song, String publicId) {
+        startRequested(player, song, publicId, beginPlay(player, player, false));
+    }
+    private void startRequested(Player player, NbsSong song, String publicId, PlayRequest request) {
+        if (!isCurrent(request)) return;
+        if (publicId != null) pendingSelections.computeIfAbsent(selectionKey(request), key -> new PendingSelection(request, publicId));
         UUID id = player.getUniqueId();
         Playback current = sessions.get(id);
 
@@ -450,12 +498,12 @@ public class PlaybackManager implements Listener {
         // replace what comes next rather than starting a second ramp.
         if (current != null && (current.isFading() || current.beginFade())) {
             cancelPending(id);
-            queuedStarts.put(id, () -> startWhenPackSettles(player, song, publicId));
+            queuedStarts.put(id, () -> startWhenPackSettles(player, song, publicId, request));
             return;
         }
 
-        stop(id);
-        startWhenPackSettles(player, song, publicId);
+        stopSession(id);
+        startWhenPackSettles(player, song, publicId, request);
     }
 
     /** True when a song is playing and already ramping down. */
@@ -464,7 +512,8 @@ public class PlaybackManager implements Listener {
         return playback != null && playback.isFading();
     }
 
-    private void startWhenPackSettles(Player player, NbsSong song, String publicId) {
+    private void startWhenPackSettles(Player player, NbsSong song, String publicId, PlayRequest request) {
+        if (!readyToStart(player, publicId, request)) return;
         ResourcePackService pack = plugin.getResourcePackService();
         if (pack.isActive() && !pack.isSettled(player.getUniqueId())) {
             // Don't start until the player's pack attempt resolves
@@ -476,7 +525,7 @@ public class PlaybackManager implements Listener {
 
                         @Override
                         public void run() {
-                            if (!player.isOnline()) {
+                            if (!readyToStart(player, publicId, request)) {
                                 cancelPending(player.getUniqueId());
                                 return;
                             }
@@ -484,22 +533,25 @@ public class PlaybackManager implements Listener {
                             if (pack.isSettled(player.getUniqueId())
                                     || waitedTicks >= PACK_WAIT_TIMEOUT_TICKS) {
                                 cancelPending(player.getUniqueId());
-                                startNow(player, song, publicId);
+                                startNow(player, song, publicId, request);
                             }
                         }
                     }, 10L, 10L);
             pendingStarts.put(player.getUniqueId(), task);
             return;
         }
-        startNow(player, song, publicId);
+        startNow(player, song, publicId, request);
     }
 
-    private void cancelPending(UUID playerId) {
+    private boolean cancelPending(UUID playerId) {
         org.bukkit.scheduler.BukkitTask task = pendingStarts.remove(playerId);
         if (task != null) task.cancel();
+        return task != null;
     }
 
-    private void startNow(Player player, NbsSong song, String publicId) {
+    private void startNow(Player player, NbsSong song, String publicId, PlayRequest request) {
+        if (!readyToStart(player, publicId, request)) return;
+        completeRequest(request);
         ensureClock();
         Playback playback = new Playback(player, song, publicId);
         // Cancel whatever we are replacing rather than just dropping it from
@@ -511,15 +563,40 @@ public class PlaybackManager implements Listener {
         if (previous != null) previous.cancelQuietly();
         playback.start();
 
-        player.sendMessage(nowPlayingMessage(song, null));
+        player.sendMessage(nowPlayingMessage(song, publicId, null));
         sendCustomNoteWarning(player, song);
     }
 
-    private Component nowPlayingMessage(NbsSong song, String starterName) {
+    /**
+     * The name to show for a song.
+     *
+     * Prefers the title recorded in the library over the one inside the .nbs.
+     * A file imported with no internal title still gets a real name at import
+     * time -- from the name given to /nbw importurl, or the file name -- and
+     * that is what the browser and /nbw playing display. Reading the NBS
+     * header here instead meant the same song appeared under its proper name
+     * everywhere except while it was playing, where it said "Untitled".
+     *
+     * Falls back to the header, then to the placeholder, so a song that has
+     * neither still shows something.
+     */
+    private String displayTitle(NbsSong song, String publicId) {
+        if (publicId != null) {
+            String stored = plugin.getDownloadManager().getTitle(publicId);
+            // getTitle returns the id when it knows no better; that is not a
+            // name worth showing when the file itself might have one.
+            if (stored != null && !stored.isBlank() && !stored.equals(publicId)) {
+                return stored;
+            }
+        }
+        if (!song.getName().isBlank()) return song.getName();
+        return PlainTextComponentSerializer.plainText()
+                .serialize(plugin.getMessages().get("playback.untitled"));
+    }
+
+    private Component nowPlayingMessage(NbsSong song, String publicId, String starterName) {
         var messages = plugin.getMessages();
-        String title = song.getName().isBlank()
-                ? PlainTextComponentSerializer.plainText().serialize(messages.get("playback.untitled"))
-                : song.getName();
+        String title = displayTitle(song, publicId);
         String author = song.getAuthor().isBlank()
                 ? PlainTextComponentSerializer.plainText().serialize(messages.get("playback.unknown-author"))
                 : song.getAuthor();
@@ -541,7 +618,7 @@ public class PlaybackManager implements Listener {
 
     private void sendCustomNoteWarning(Player player, NbsSong song) {
         if (song.getSkippedCustomNotes() > 0) {
-            player.sendMessage(plugin.getMessages().get("playback.custom-notes-skipped",
+            player.sendMessage(plugin.getMessages().get("playback.custom-notes-undefined",
                     Placeholder.unparsed("count", String.valueOf(song.getSkippedCustomNotes()))));
         }
         if (song.getSkippedDenseNotes() > 0) {
@@ -555,10 +632,25 @@ public class PlaybackManager implements Listener {
         startBroadcast(starter, song, null);
     }
 
-    /** Starts a server-wide broadcast, replacing any current broadcast. */
+    /** Fades the outgoing broadcast, then starts the latest requested replacement. */
     public void startBroadcast(Player starter, NbsSong song, String publicId) {
-        stopBroadcast();
+        startBroadcastRequested(starter, song, publicId, beginPlay(starter, null, true));
+    }
+    private void startBroadcastRequested(Player starter, NbsSong song, String publicId, PlayRequest request) {
+        if (!isCurrent(request)) return;
+        if (publicId != null) pendingSelections.computeIfAbsent(selectionKey(request), key -> new PendingSelection(request, publicId));
+        Playback current = broadcastSession;
+        if (current != null && (current.isFading() || current.beginFade())) {
+            cancelPendingBroadcast();
+            queuedBroadcastStart = () -> startBroadcastWhenPackSettles(starter, song, publicId, request);
+            return;
+        }
+        stopBroadcastSession();
+        startBroadcastWhenPackSettles(starter, song, publicId, request);
+    }
 
+    private void startBroadcastWhenPackSettles(Player starter, NbsSong song, String publicId, PlayRequest request) {
+        if (!readyToStart(starter, publicId, request)) return;
         ResourcePackService pack = plugin.getResourcePackService();
         if (pack.isActive() && !allOnlineResolved(pack)) {
             // Wait until EVERY online player's pack attempt has resolved.
@@ -572,19 +664,20 @@ public class PlaybackManager implements Listener {
                         @Override
                         public void run() {
                             waitedTicks += 10;
+                            if (!readyToStart(starter, publicId, request)) { cancelPendingBroadcast(); return; }
                             if (allOnlineResolved(pack)
                                     || waitedTicks >= PACK_WAIT_TIMEOUT_TICKS) {
                                 if (pendingBroadcast != null) {
                                     pendingBroadcast.cancel();
                                     pendingBroadcast = null;
                                 }
-                                startBroadcastNow(starter, song, publicId);
+                                startBroadcastNow(starter, song, publicId, request);
                             }
                         }
                     }, 10L, 10L);
             return;
         }
-        startBroadcastNow(starter, song, publicId);
+        startBroadcastNow(starter, song, publicId, request);
     }
 
     private boolean allOnlineResolved(ResourcePackService pack) {
@@ -594,19 +687,38 @@ public class PlaybackManager implements Listener {
         return true;
     }
 
-    private void startBroadcastNow(Player starter, NbsSong song, String publicId) {
+    private void startBroadcastNow(Player starter, NbsSong song, String publicId, PlayRequest request) {
+        if (!readyToStart(starter, publicId, request)) return;
+        completeRequest(request);
         ensureClock();
         broadcastSession = new Playback(null, song, publicId);
         broadcastSession.start();
 
         // Player#getName works even if the starter logged off mid-wait
-        plugin.getServer().sendMessage(nowPlayingMessage(song, starter.getName()));
+        plugin.getServer().sendMessage(nowPlayingMessage(song, publicId, starter.getName()));
         if (starter.isOnline()) {
             sendCustomNoteWarning(starter, song);
         }
     }
 
-    /** Stops a player's personal session (and any pending pack wait). */
+    /** Revalidate library-backed selections after fades and pack-loading waits. */
+    private boolean readyToStart(Player feedback, String publicId, PlayRequest request) {
+        if (!isCurrent(request)) return false;
+        PendingSelection selection = pendingSelections.get(selectionKey(request));
+        boolean changed = selection != null && selection.request.equals(request) && selection.invalidated;
+        if (!changed && (publicId == null || plugin.getDownloadManager().isDownloaded(publicId))) return true;
+        completeRequest(request);
+        if (request.broadcast()) {
+            cancelPendingBroadcast(); queuedBroadcastStart = null;
+        } else {
+            cancelPending(request.listener()); queuedStarts.remove(request.listener());
+        }
+        feedback.sendMessage(plugin.getMessages().get("playback.read-error",
+                Placeholder.unparsed("reason", changed ? "Song data was invalidated; select it again"
+                        : "Song is no longer downloaded; select it again")));
+        return false;
+    }
+
     /**
      * Stops a player's song at once, with no ramp.
      *
@@ -617,12 +729,47 @@ public class PlaybackManager implements Listener {
      * player actually asked for.
      */
     public boolean stop(UUID playerId) {
-        cancelPending(playerId);
+        pendingSelections.remove(playerId);
+        loadCallbacks.remove(playerId);
+        boolean loading = playRequests.remove(playerId) != null;
+        boolean stopped = stopSession(playerId);
+        stopped = cutTail(playerId) || stopped;
+        return loading || stopped;
+    }
+    private boolean cutTail(UUID playerId) {
+        return cutVoices(playerId, voice -> !voice.broadcast());
+    }
+
+    /** Stop only recorded music events. Shared event names must be allowed to decay. */
+    private boolean cutVoices(UUID playerId, java.util.function.Predicate<Voice> selected) {
+        Voices voices = listenerVoices.get(playerId); if (voices == null) return false;
+        synchronized (voices) {
+            voices.expire(System.nanoTime()); if (voices.ends.isEmpty()) return false;
+            java.util.Set<Object> sounds = new java.util.HashSet<>();
+            java.util.Set<Object> protectedSounds = new java.util.HashSet<>();
+            for (Voice voice : voices.ends) {
+                (selected.test(voice) ? sounds : protectedSounds).add(voice.sound());
+            }
+            if (sounds.isEmpty()) return false;
+            // Minecraft can stop an event, not one instance of that event. If
+            // another session uses the same event, preserve both ringing tails.
+            sounds.removeAll(protectedSounds);
+            Player player = plugin.getServer().getPlayer(playerId);
+            if (player != null) for (Object sound : sounds) {
+                if (sound instanceof Sound vanilla) player.stopSound(vanilla, SoundCategory.RECORDS);
+                else player.stopSound((String) sound, SoundCategory.RECORDS);
+            }
+            voices.ends.removeIf(voice -> sounds.contains(voice.sound()));
+            return true;
+        }
+    }
+    private boolean stopSession(UUID playerId) {
+        boolean waiting = cancelPending(playerId);
         // Drop anything queued behind a fade: stopping must mean stop, not
         // "stop and then start the song I was switching to".
-        queuedStarts.remove(playerId);
+        boolean queued = queuedStarts.remove(playerId) != null;
         Playback playback = sessions.remove(playerId);
-        if (playback == null) return false;
+        if (playback == null) return waiting || queued;
         playback.cancelQuietly();
         maybeStopClock();
         return true;
@@ -637,16 +784,18 @@ public class PlaybackManager implements Listener {
      * feels responsive.
      */
     public boolean stopFading(UUID playerId) {
+        pendingSelections.remove(playerId);
+        loadCallbacks.remove(playerId);
+        boolean loading = playRequests.remove(playerId) != null;
+        queuedStarts.remove(playerId);
         Playback playback = sessions.get(playerId);
         if (playback != null && playback.beginFade()) {
             cancelPending(playerId);
             return true;
         }
-        return stop(playerId);
+        return stop(playerId) || loading;
     }
 
-    /** Stops the server-wide broadcast (and any pending pack wait). Main thread only. */
-    /** Stops the broadcast, ramping down first when fade-out-ms allows. */
     /**
      * Fades out every personal (non-broadcast) session. Returns true if at
      * least one was playing. Used by "/nbw stop @a" together with the
@@ -654,30 +803,73 @@ public class PlaybackManager implements Listener {
      */
     public boolean stopAllPersonalFading() {
         boolean any = false;
-        for (UUID id : sessions.keySet().toArray(UUID[]::new)) {
+        java.util.Set<UUID> ids = new java.util.HashSet<>(sessions.keySet());
+        ids.addAll(pendingStarts.keySet());
+        ids.addAll(playRequests.keySet());
+        ids.addAll(listenerVoices.keySet());
+        for (UUID id : ids) {
             if (stopFading(id)) any = true;
         }
         return any;
     }
 
-    public boolean stopBroadcastFading() {
-        Playback session = broadcastSession;
-        if (session != null && session.beginFade()) {
-            if (pendingBroadcast != null) {
-                pendingBroadcast.cancel();
-                pendingBroadcast = null;
-            }
-            return true;
+    /** Global stop: preserve active fades, but select all finished tails together. */
+    public boolean stopEveryoneFading() {
+        boolean any = stopBroadcastFading();
+        any |= stopAllPersonalFading();
+        Playback broadcast = broadcastSession;
+        for (UUID id : listenerVoices.keySet()) {
+            Playback personal = sessions.get(id);
+            // Selecting personal and broadcast tails separately makes shared
+            // event names protect each other even though both should stop.
+            // Voices of sessions still fading must retain that protection.
+            any = cutVoices(id, voice ->
+                    (personal == null || voice.owner() != personal.voiceOwner)
+                    && (broadcast == null || voice.owner() != broadcast.voiceOwner)) || any;
         }
-        return stopBroadcast();
+        return any;
     }
 
-    public boolean stopBroadcast() {
+    public boolean stopBroadcastFading() {
+        pendingSelections.remove("broadcast");
+        loadCallbacks.remove("broadcast");
+        boolean loading = broadcastRequest != null; broadcastRequest = null;
+        boolean waiting = cancelPendingBroadcast();
+        boolean queued = queuedBroadcastStart != null;
+        queuedBroadcastStart = null;
+        Playback session = broadcastSession;
+        if (session != null && session.beginFade()) {
+            return true;
+        }
+        return stopBroadcast() || waiting || queued || loading;
+    }
+
+    private boolean cancelPendingBroadcast() {
         if (pendingBroadcast != null) {
             pendingBroadcast.cancel();
             pendingBroadcast = null;
+            return true;
         }
-        if (broadcastSession == null) return false;
+        return false;
+    }
+
+    /** Immediately stops the broadcast and cancels any queued or pack-waiting start. */
+    public boolean stopBroadcast() {
+        pendingSelections.remove("broadcast");
+        loadCallbacks.remove("broadcast");
+        boolean loading = broadcastRequest != null; broadcastRequest = null;
+        boolean stopped = stopBroadcastSession();
+        // Completed sessions no longer occupy broadcastSession, but their
+        // samples may still ring. An explicit stop also owns those tails.
+        for (UUID id : listenerVoices.keySet())
+            stopped = cutVoices(id, Voice::broadcast) || stopped;
+        return stopped || loading;
+    }
+    private boolean stopBroadcastSession() {
+        boolean waiting = cancelPendingBroadcast();
+        boolean queued = queuedBroadcastStart != null;
+        queuedBroadcastStart = null;
+        if (broadcastSession == null) return waiting || queued;
         broadcastSession.cancelQuietly();
         broadcastSession = null;
         maybeStopClock();
@@ -686,8 +878,34 @@ public class PlaybackManager implements Listener {
 
     /** Drops a parsed song from the cache (call when a song is removed). */
     public void invalidateCache(String publicId) {
-        songCache.remove(publicId);
-        customRingCache.remove(publicId);
+        SongLoad load;
+        synchronized (songCache) {
+            // Mark synchronously even when reload invalidates on a worker. A
+            // queued callback must reject old data before main-thread cleanup runs.
+            for (PendingSelection selection : pendingSelections.values()) {
+                if (!selection.songId.equals(publicId)) continue;
+                selection.invalidated = true;
+                plugin.runMain(() -> {
+                    if (pendingSelections.get(selectionKey(selection.request)) != selection
+                            || !isCurrent(selection.request)) return;
+                    Player feedback = plugin.getServer().getPlayer(selection.request.caller());
+                    if (feedback != null) readyToStart(feedback, publicId, selection.request);
+                });
+            }
+            load = loadingSongs.remove(publicId);
+            songCache.remove(publicId);
+        }
+        if (load != null) load.future().cancel(true);
+    }
+
+    /** Audio changes do not invalidate immutable note data or unrelated parse requests. */
+    public void invalidateSampleCaches() { vanillaRingCache = null; }
+
+    /** Called by the pack builder off-thread after audio changes. Published to ongoing sessions too. */
+    public void refreshSampleTimings() {
+        double[] durations = new double[INSTRUMENT_SOUNDS.length];
+        for (int i=0; i<durations.length; i++) durations[i] = plugin.getResourcePackService().sampleSeconds(i);
+        vanillaRingCache = durations;
     }
 
     /**
@@ -703,42 +921,17 @@ public class PlaybackManager implements Listener {
         return false;
     }
 
-    /**
-     * Reads how long each sample this song uses actually rings, from the Ogg
-     * files themselves (granule position = exact sample count). Blocking file
-     * I/O — only called from the async load path.
-     */
-    private void measureRingTimes(String publicId, NbsSong song) {
-        try {
-            if (vanillaRingCache == null || !hasMeasured(vanillaRingCache)) {
-                double[] vanilla = new double[INSTRUMENT_SOUNDS.length];
-                for (int i = 0; i < vanilla.length; i++) {
-                    vanilla[i] = plugin.getResourcePackService().sampleSeconds(i);
-                }
-                vanillaRingCache = vanilla;
-            }
-            if (!song.getCustomSoundFiles().isEmpty()
-                    && !customRingCache.containsKey(publicId)) {
-                Map<Integer, Double> measured = PolyphonyAnalyzer
-                        .customSampleLengths(plugin, song, publicId);
-                double[] custom = new double[song.getCustomSoundFiles().size()];
-                java.util.Arrays.fill(custom, -1);
-                for (Map.Entry<Integer, Double> entry : measured.entrySet()) {
-                    if (entry.getKey() < custom.length) {
-                        custom[entry.getKey()] = entry.getValue();
-                    }
-                }
-                customRingCache.put(publicId, custom);
-            }
-        } catch (Exception e) {
-            // Allocation falls back to a 1-second estimate; never block playback
-            plugin.getLogger().warning("Could not measure sample lengths for "
-                    + publicId + ": " + e);
-        }
+    /** Cold loads may precede the first pack build; initialize the vanilla fallback timings off-thread. */
+    private void measureVanillaRingTimes() {
+        if (vanillaRingCache == null || !hasMeasured(vanillaRingCache)) refreshSampleTimings();
     }
 
     /** Stops everything; call from onDisable. */
     public void stopAll() {
+        pendingSelections.clear();
+        playRequests.clear(); broadcastRequest = null; loadCallbacks.clear();
+        loadingSongs.values().forEach(f -> f.future().cancel(true)); loadingSongs.clear();
+        songCache.clear();
         for (UUID id : pendingStarts.keySet().toArray(UUID[]::new)) {
             cancelPending(id);
         }
@@ -746,12 +939,25 @@ public class PlaybackManager implements Listener {
             stop(id);
         }
         stopBroadcast();
+        for (UUID id : listenerVoices.keySet()) cutVoices(id, voice -> true);
+        listenerVoices.clear();
         shutdownClock();
     }
 
     @EventHandler
     public void onQuit(PlayerQuitEvent event) {
-        stop(event.getPlayer().getUniqueId());
+        UUID id = event.getPlayer().getUniqueId();
+        pendingSelections.entrySet().removeIf(entry -> entry.getValue().request.caller().equals(id)
+                || id.equals(entry.getValue().request.listener()));
+        stop(id);
+        playRequests.entrySet().removeIf(e -> e.getValue().caller().equals(id)
+                || id.equals(e.getValue().listener()));
+        PlayRequest waiting = broadcastRequest;
+        if (waiting != null && waiting.caller().equals(id)) { broadcastRequest = null; cancelPendingBroadcast(); queuedBroadcastStart = null; }
+        listenerVoices.remove(id);
+        loadCallbacks.entrySet().removeIf(e -> e.getValue().feedback().getUniqueId().equals(id));
+        Playback broadcast = broadcastSession;
+        if (broadcast != null) broadcast.customWarnings.remove(id);
     }
 
     // ------------------------------------------------------------------
@@ -763,15 +969,9 @@ public class PlaybackManager implements Listener {
      * reusing the same LRU cache playback uses so repeat calls are free.
      */
     public void inspect(String publicId, Player feedback, Consumer<NbsSong> onLoaded) {
-        loadSong(publicId, feedback, onLoaded);
+        loadSong(publicId, feedback, new InspectionOwner(feedback.getUniqueId()), onLoaded);
     }
 
-    /**
-     * The song this player is currently hearing, or null. A live broadcast
-     * overrides personal playback (mirroring the emission rule), so it is
-     * reported first; the player's own session is what they hear only when no
-     * broadcast is running.
-     */
     /**
      * A read-only view of one active session, for "/nbw playing". Carries the
      * display title and elapsed/total seconds so the command needs no access
@@ -783,7 +983,7 @@ public class PlaybackManager implements Listener {
     /**
      * Snapshot of everything currently playing: the broadcast first (if any),
      * then each personal session. Personal sessions that are silenced under a
-     * live broadcast are still included and flagged, so an admin sees the full
+     * live broadcast are still included, so an admin sees the full
      * picture rather than only what is audible.
      */
     public List<ActiveSong> activeSongs() {
@@ -805,10 +1005,14 @@ public class PlaybackManager implements Listener {
     }
 
     private String titleOf(Playback pb) {
-        String name = pb.song.getName();
-        return name.isBlank() ? pb.publicId : name;
+        return displayTitle(pb.song, pb.publicId);
     }
 
+    /**
+     * The song this player is currently hearing, or null. A live broadcast
+     * overrides personal playback; the player's own session is used only when
+     * no broadcast is running.
+     */
     public String currentSongIdFor(UUID playerId) {
         Playback broadcast = broadcastSession;
         if (broadcast != null) return broadcast.publicId;
@@ -816,79 +1020,72 @@ public class PlaybackManager implements Listener {
         return own != null ? own.publicId : null;
     }
 
-    private void loadSong(String publicId, Player feedback, Consumer<NbsSong> onLoaded) {
-        NbsSong cached = songCache.get(publicId);
-        if (cached != null) {
-            onLoaded.accept(cached);
-            return;
-        }
-
-        Path file = plugin.getDownloadManager().getNbsFile(publicId);
-        CompletableFuture
-                .supplyAsync(() -> {
-                    try {
-                        NbsSong parsed = NbsParser.parse(file);
-                        // Measure sample ring times here, while already off
-                        // the main thread: voice allocation needs them, and
-                        // reading them lazily on the clock thread would
-                        // stutter the first notes of the song.
-                        measureRingTimes(publicId, parsed);
-                        return parsed;
-                    } catch (IOException e) {
-                        throw new UncheckedIOException(e);
-                    }
-                })
-                .whenComplete((song, throwable) ->
-                        Bukkit.getScheduler().runTask(plugin, () -> {
-                            if (throwable != null) {
-                                if (feedback.isOnline()) {
-                                    // A song can be removed while still cached and
-                                    // playing; analysing or replaying it then reads
-                                    // a file that is gone. The failure arrives wrapped
-                                    // twice (CompletionException -> UncheckedIOException
-                                    // -> NoSuchFileException), so the ROOT cause is what
-                                    // must be inspected -- checking one level down finds
-                                    // only the UncheckedIOException.
-                                    if (Throwables.isMissingFile(throwable)) {
-                                        feedback.sendMessage(
-                                                plugin.getMessages().get("playback.song-deleted"));
-                                    } else {
-                                        feedback.sendMessage(plugin.getMessages().get("playback.read-error",
-                                                Placeholder.unparsed("reason", Throwables.describe(throwable))));
-                                    }
-                                }
-                                return;
-                            }
-                            songCache.put(publicId, song);
-                            if (feedback.isOnline()) {
-                                onLoaded.accept(song);
-                            }
-                        }));
+    private void loadSong(String id, Player feedback, Object ownerKey, Consumer<NbsSong> onLoaded) {
+        loadCallbacks.remove(ownerKey);
+        NbsSong cached = songCache.get(id);
+        if (cached != null) { onLoaded.accept(cached); return; }
+        java.util.concurrent.atomic.AtomicBoolean created = new java.util.concurrent.atomic.AtomicBoolean();
+        SongLoad loading = loadingSongs.computeIfAbsent(id, key -> {
+            created.set(true);
+            return new SongLoad(UUID.randomUUID(), plugin.getWorkPool().submit(() -> {
+                try {
+                    NbsSong song = NbsParser.parse(plugin.getDownloadManager().getNbsFile(key));
+                    measureVanillaRingTimes(); return song;
+                } catch (IOException e) { throw new UncheckedIOException(e); }
+            }));
+        });
+        loadCallbacks.put(ownerKey, new LoadCallback(id, loading.token(), feedback, onLoaded));
+        if (!created.get()) return; // one completion and one pending callback per listener/inspection
+        loading.future().whenComplete((song, error) -> {
+            if (plugin.isStopping()) return;
+            plugin.runMain(() -> {
+                boolean valid;
+                synchronized (songCache) {
+                    valid = loadingSongs.remove(id, loading) && plugin.getDownloadManager().isDownloaded(id);
+                    if (valid && error == null) songCache.put(id, song);
+                }
+                for (var entry : List.copyOf(loadCallbacks.entrySet())) {
+                    LoadCallback callback = entry.getValue();
+                    if (!callback.id().equals(id) || !callback.token().equals(loading.token())) continue;
+                    if (!loadCallbacks.remove(entry.getKey(), callback) || !callback.feedback().isOnline()) continue;
+                    if (valid && error == null) callback.accept().accept(song);
+                    else callback.feedback().sendMessage(plugin.getMessages().get("playback.read-error",
+                            Placeholder.unparsed("reason", error == null ? "Song changed; select it again" : Throwables.describe(error))));
+                }
+            });
+        });
     }
-
 
     // ------------------------------------------------------------------
 
     /**
-     * A note scheduled slightly off its exact tick.
+     * A chord, or its melodic/percussion group, scheduled slightly off its exact tick.
      *
      * The limiter gain is captured HERE, at schedule time, from the size of
-     * the whole chord. Humanisation scatters a chord across several clock
-     * steps, so by emission time each step sees only a note or two — the
-     * limiter would never see the chord it is meant to be taming.
+     * the whole chord, preserving its balance when percussion and melody
+     * use different timing offsets. Equal deadlines keep insertion order.
      */
-    private record Scheduled(long dueNanos, PlayableNote note, float chordGain) {}
+    private record Scheduled(long dueNanos, long sequence, int from, int to,
+                             float chordGain, int group, boolean ordered) {}
 
     /**
      * One listener's state, captured on the MAIN thread once per game tick.
      * The clock thread reads only this — never the live world — so nothing
      * touches Bukkit off-thread.
+     *
+     * forward/right are null unless stereo panning applies; velocity is in
+     * blocks per second and leadSeconds is the listener's round-trip time.
      */
-    private record Listener(Player player, org.bukkit.Location ear,
-                            org.bukkit.util.Vector right, float volume, boolean extended,
-                            double eyeHeight) {}
+    private record Listener(Player player, UUID id, org.bukkit.Location ear,
+                            double[] forward, double[] right, double[] velocity, long sampledNanos, double leadSeconds,
+                            float volume, Map<String, Double> eventSeconds,
+                            double eyeHeight, Voices voices) {}
+    /** Last sampled ear position per listener, for velocity. Main thread only. */
+    private record EarSample(org.bukkit.World world, double x, double y, double z, long nanos) {}
 
     private class Playback {
+        // A small token lets tails retain ownership without retaining the song/session.
+        private final Object voiceOwner = new Object();
 
         /** Session owner for personal playback; null for a broadcast. */
         private final Player owner;
@@ -896,11 +1093,13 @@ public class PlaybackManager implements Listener {
         private final String publicId;
         /** [customIndex][octave+3] -> full sound key, null when unavailable. */
         private final String[][] customSoundKeys;
-        /** The same, minus the "nbw:" prefix, for allocation-free hasEvent. */
+        /** The same, minus the "nbw:" prefix, for immutable manifest lookups. */
         private final String[][] customSoundEvents;
 
         /** Refreshed on the main thread each tick; read by the clock thread. */
         private volatile List<Listener> listeners = List.of();
+        /** Main-thread warning fingerprints; unchanged problems are reported only once. */
+        private final Map<UUID, String> customWarnings = new java.util.HashMap<>();
         private volatile boolean started = false;
         private volatile boolean cancelled = false;
         private volatile boolean finishing = false;
@@ -910,7 +1109,7 @@ public class PlaybackManager implements Listener {
         /** Timing state, only ever touched by the stepping thread. */
         private double currentTempo;
         private double position = 0;
-        private int lastPlayedTick = -1;
+        private int nextChord;
         private int loopsDone = 0;
         private long lastStepNanos = 0;
 
@@ -928,27 +1127,50 @@ public class PlaybackManager implements Listener {
         private final org.bukkit.Location panScratch =
                 new org.bukkit.Location(null, 0, 0, 0);
 
-        private org.bukkit.Location panLocation(org.bukkit.Location ear,
-                                                org.bukkit.util.Vector right, float pan) {
-            if (right == null || pan == 0f) return ear;
-            double offset = pan * panDistance;
+        /** Ear positions from the previous snapshot, for velocity. Main thread only. */
+        private Map<UUID, EarSample> lastEars = Map.of();
+
+        /**
+         * Where a world-placed note should sound for this listener.
+         *
+         * Two corrections over placing it at the last snapshot:
+         *
+         * 1. Panning is by DIRECTION. The note sits at the angle whose sine
+         *    is the pan, pan-distance from the camera. Previously it was put
+         *    straight to the side at pan x pan-distance, and a sound directly
+         *    to the side pans fully however close it is, so every panned note
+         *    came out hard left or hard right.
+         *
+         * 2. The listener keeps moving. The snapshot is up to a tick old, and
+         *    the client receives the packet about one round trip after the
+         *    position the server last heard from it. The note is led along
+         *    the listener's velocity by that time, so it starts where they
+         *    actually are rather than behind them -- the gap that made notes
+         *    lurch sideways and fade while sprinting or flying.
+         *
+         * A note still stays where it started once it plays: Minecraft cannot
+         * move a playing sound. follow-player avoids that drift entirely.
+         */
+        private org.bukkit.Location panLocation(Listener listener, float pan, long now) {
+            org.bukkit.Location ear = listener.ear();
+            double[] velocity = listener.velocity();
+            double ahead = Math.min(MAX_LEAD_SECONDS,
+                    Math.max(0, (now - listener.sampledNanos()) / 1_000_000_000.0) + listener.leadSeconds());
+            double x = velocity[0] * ahead, y = velocity[1] * ahead, z = velocity[2] * ahead;
+            double lead = Math.sqrt(x * x + y * y + z * z);
+            if (lead > MAX_LEAD_BLOCKS) { double scale = MAX_LEAD_BLOCKS / lead; x *= scale; y *= scale; z *= scale; }
+            if (listener.forward() != null && pan != 0f) {
+                double[] offset = PanGeometry.offset(pan, panDistance, listener.forward(), listener.right());
+                x += offset[0]; y += offset[1]; z += offset[2];
+            }
+            if (x == 0 && y == 0 && z == 0) return ear;
             panScratch.setWorld(ear.getWorld());
-            panScratch.setX(ear.getX() + right.getX() * offset);
-            panScratch.setY(ear.getY() + right.getY() * offset);
-            panScratch.setZ(ear.getZ() + right.getZ() * offset);
+            panScratch.setX(ear.getX() + x);
+            panScratch.setY(ear.getY() + y);
+            panScratch.setZ(ear.getZ() + z);
             return panScratch;
         }
 
-        /**
-         * Expiry stamps (nanos) of voices believed still ringing on the
-         * client. A min-heap: the head is the next to fall silent. Stepping
-         * thread only. NOT cleared on loop restart — the client keeps ringing
-         * those samples across the loop seam, so the channels stay occupied.
-         */
-        private final java.util.PriorityQueue<Long> ringing = new java.util.PriorityQueue<>();
-        /** Ring times captured at construction; may be null (fallback 1s). */
-        private final double[] vanillaRing;
-        private final double[] customRing;
 
         /**
          * nanoTime the fade began, or 0 when not fading. Volatile: set on the
@@ -958,7 +1180,8 @@ public class PlaybackManager implements Listener {
 
         /** Notes awaiting their humanised moment. Stepping thread only. */
         private final java.util.PriorityQueue<Scheduled> pending = new java.util.PriorityQueue<>(
-                java.util.Comparator.comparingLong(Scheduled::dueNanos));
+                java.util.Comparator.comparingLong(Scheduled::dueNanos).thenComparingLong(Scheduled::sequence));
+        private long scheduledSequence;
         /**
          * The current "where the beat sits" offset, in milliseconds. It drifts
          * a little each chord (a random walk) instead of being redrawn from
@@ -971,8 +1194,6 @@ public class PlaybackManager implements Listener {
             this.owner = owner;
             this.song = song;
             this.publicId = publicId;
-            this.vanillaRing = vanillaRingCache;
-            this.customRing = publicId != null ? customRingCache.get(publicId) : null;
             this.currentTempo = NbsSong.clampTempo(song.getTempo());
 
             List<String> files = song.getCustomSoundFiles();
@@ -1016,7 +1237,7 @@ public class PlaybackManager implements Listener {
                 // Identity-checked: if the player already started a NEW song,
                 // that session owns this slot now and must not be evicted by
                 // an older one tidying itself up.
-                sessions.remove(owner.getUniqueId(), this);
+                if (!sessions.remove(owner.getUniqueId(), this)) { cancelLettingRing(); return; }
                 // This path bypasses finish(), so anything queued behind the
                 // fade would otherwise sit in the map forever.
                 queuedStarts.remove(owner.getUniqueId());
@@ -1034,7 +1255,9 @@ public class PlaybackManager implements Listener {
 
             // Without the clock thread, the game tick drives playback (50 ms
             // resolution — notes above 20 t/s get batched).
-            if (!highPrecision) step();
+            if (!highPrecision && driverLock.tryLock()) {
+                try { if (!highPrecision) step(); } finally { driverLock.unlock(); }
+            }
         }
 
         /** Main thread: capture everything the clock thread will need. */
@@ -1042,17 +1265,67 @@ public class PlaybackManager implements Listener {
             ResourcePackService pack = plugin.getResourcePackService();
             boolean packActive = pack.isActive();
             List<Listener> snapshot = new ArrayList<>();
+            Map<UUID, EarSample> ears = new java.util.HashMap<>();
+            long sampled = System.nanoTime();
 
             for (Player player : audience(pack, packActive)) {
                 float volume = plugin.getVolumeManager().getFactor(player.getUniqueId());
                 if (volume <= 0f) continue;              // muted: emit nothing
+                warnUnavailableCustomAudio(player, pack, packActive);
                 org.bukkit.Location ear = player.getEyeLocation();
-                org.bukkit.util.Vector right = stereoPanning ? rightVector(ear.getYaw()) : null;
-                boolean extended = packActive && pack.isPackLoaded(player.getUniqueId());
-                snapshot.add(new Listener(player, ear, right, volume, extended,
-                        player.getEyeHeight()));
+                double[] forward = stereoPanning ? PanGeometry.forward(ear.getYaw(), ear.getPitch()) : null;
+                double[] right = stereoPanning ? PanGeometry.right(ear.getYaw()) : null;
+                double[] velocity = NO_MOTION;
+                double leadSeconds = 0;
+                if (!followPlayer) {
+                    // Attached sounds follow the player client-side already;
+                    // only world-placed notes need the movement estimate.
+                    EarSample previous = lastEars.get(player.getUniqueId());
+                    ears.put(player.getUniqueId(), new EarSample(ear.getWorld(), ear.getX(), ear.getY(), ear.getZ(), sampled));
+                    if (previous != null && previous.world() == ear.getWorld()) {
+                        double seconds = (sampled - previous.nanos()) / 1_000_000_000.0;
+                        double dx = ear.getX() - previous.x(), dy = ear.getY() - previous.y(), dz = ear.getZ() - previous.z();
+                        // A teleport or a long gap is not motion to extrapolate.
+                        if (seconds > 0 && seconds < 1 && dx * dx + dy * dy + dz * dz < TELEPORT_BLOCKS * TELEPORT_BLOCKS)
+                            velocity = new double[]{dx / seconds, dy / seconds, dz / seconds};
+                    }
+                    leadSeconds = Math.max(0, Math.min(1000, player.getPing())) / 1000.0;
+                }
+                // Voice accounting is created here, on the main thread, for
+                // online listeners only. The clock thread uses this reference;
+                // creating it there re-registered players who had just quit
+                // while a stale snapshot was still being played, and nothing
+                // ever removed those entries again.
+                Voices voices = listenerVoices.computeIfAbsent(player.getUniqueId(), unused -> new Voices());
+                snapshot.add(new Listener(player, player.getUniqueId(), ear, forward, right, velocity, sampled, leadSeconds,
+                        volume, pack.eventDurations(player.getUniqueId()), player.getEyeHeight(), voices));
             }
+            this.lastEars = ears;
             this.listeners = List.copyOf(snapshot);
+        }
+
+        /** Checks actual pack availability after the listener's loading/settling wait. */
+        private void warnUnavailableCustomAudio(Player player, ResourcePackService pack, boolean packActive) {
+            if (song.getCustomNoteCount() == 0) return;
+            UUID id = player.getUniqueId();
+            boolean loaded = pack.isPackLoaded(id);
+            String state = loaded + ":" + pack.getPackSha1();
+            if (state.equals(customWarnings.put(id, state))) return;
+            int missing = 0;
+            List<String> files = new ArrayList<>();
+            for (int i = 0; i < customSoundEvents.length; i++) {
+                int count = song.getCustomNoteCount(i);
+                if (count == 0) continue;
+                if (!loaded || !pack.hasEvent(id, customSoundEvents[i][3])) {
+                    missing += count;
+                    if (files.size() < 5) files.add(io.github.noteblockworldmc.util.Limits.display(song.getCustomSoundFiles().get(i), 120));
+                }
+            }
+            if (missing == 0) return;
+            player.sendMessage(plugin.getMessages().get(loaded
+                            ? "playback.custom-audio-missing" : "playback.custom-audio-no-pack",
+                    Placeholder.unparsed("count", String.valueOf(missing)),
+                    Placeholder.unparsed("files", String.join(", ", files))));
         }
 
         /** Main thread. Who hears this session right now. */
@@ -1084,7 +1357,9 @@ public class PlaybackManager implements Listener {
          * the song in progress.
          */
         private boolean canHear(ResourcePackService pack, boolean packActive, Player player) {
-            return !packActive || pack.isSettled(player.getUniqueId());
+            // Running songs only pause while a push is really being applied;
+            // a merely requested rebuild must not mute them (starts still wait).
+            return !packActive || pack.canHear(player.getUniqueId());
         }
 
         // --------------------------------------------------------------
@@ -1093,15 +1368,15 @@ public class PlaybackManager implements Listener {
 
         /** Re-anchors the clock so a pause (e.g. a settings reload) isn't
          *  mistaken for elapsed song time. */
-        void resync() {
-            lastStepNanos = System.nanoTime();
-        }
+        private volatile boolean needsResync;
+        void resync() { needsResync = true; }
 
         /** Advances by real elapsed time and emits any notes now due. */
         void step() {
             if (!started || cancelled) return;
 
             long now = System.nanoTime();
+            if (needsResync) { needsResync = false; lastStepNanos = now; return; }
 
             // Checked on EVERY step, not only when the song advances to a new
             // tick: the tick gate meant a slow song (0.2 t/s = one tick every
@@ -1119,58 +1394,27 @@ public class PlaybackManager implements Listener {
             delta = Math.min(delta, 0.25);
 
             elapsedSeconds += delta;
-            position += currentTempo * delta;
-            int upTo = (int) Math.floor(position);
-
             List<Listener> snapshot = listeners;
-            ResourcePackService pack = plugin.getResourcePackService();
-
-            if (upTo > lastPlayedTick) {
-                for (int tick = lastPlayedTick + 1; tick <= upTo; tick++) {
-                    List<PlayableNote> notes = song.getNotesAt(tick);
-                    if (humanize) {
-                        scheduleHumanised(notes, tick, now);
-                    } else {
-                        emit(notes, snapshot, pack, now);
-                    }
-                    lastPlayedTick = tick;
-
-                    Double tempoChange = song.getTempoChangeAt(tick);
-                    if (tempoChange != null) {
-                        // Re-anchor at the change so remaining fractional
-                        // progress at the old rate can't overshoot notes that
-                        // should now take longer (or arrive sooner).
-                        //
-                        // The overshoot is CONVERTED rather than discarded.
-                        // position had already moved a little past this tick,
-                        // and that fraction is real elapsed time -- dropping it
-                        // stalled the song by about half a clock interval at
-                        // every change. Individually inaudible, but a song with
-                        // dense tempo automation has thousands of changes, and
-                        // it accumulated into seconds of drift against the
-                        // duration shown in the action bar.
-                        double overshoot = position - tick;
-                        double previousTempo = currentTempo;
-                        currentTempo = NbsSong.clampTempo(tempoChange);
-                        // Same wall-clock time, expressed in the new tempo's ticks.
-                        position = tick + overshoot * (currentTempo / previousTempo);
-                        break;
-                    }
+            double end = song.getDurationSeconds();
+            while (!cancelled) {
+                position = song.positionAtSeconds(elapsedSeconds);
+                int upTo = Math.min(song.getLengthTicks(), (int)Math.floor(position + 1e-9));
+                while (nextChord < song.chordCount() && song.chordTick(nextChord) <= upTo) {
+                    if (cancelled) return;
+                    int chord = nextChord++;
+                    currentTempo = song.getTempoAt(song.chordTick(chord));
+                    if (humanize) scheduleHumanised(chord, now);
+                    else emitChord(song.chordStart(chord), song.chordEnd(chord), snapshot);
                 }
-            }
-
-            // Drain whenever anything is queued -- not only when humanize is
-            // currently on. Toggling it off via /nbw reload mid-song can leave
-            // notes already scheduled; without this they'd never play AND the
-            // finish gate below would wait forever for a queue nothing drains.
-            if (!pending.isEmpty()) drainPending(now, snapshot, pack);
-
-            // Don't end the song while humanised notes are still due
-            if (lastPlayedTick >= song.getLengthTicks() && pending.isEmpty()) {
+                currentTempo = song.getTempoAt(Math.max(0, upTo));
+                if (!pending.isEmpty()) drainPending(now, snapshot);
+                if (elapsedSeconds + 1e-10 < end) break;
                 if (shouldLoop()) {
-                    restartLoop();
+                    double carry = Math.max(0, elapsedSeconds - end);
+                    restartLoop(); elapsedSeconds += carry;
                 } else {
-                    requestFinish();
+                    if (pending.isEmpty()) requestFinish();
+                    break;
                 }
             }
         }
@@ -1183,27 +1427,19 @@ public class PlaybackManager implements Listener {
          * have landed rather than from the step boundary — otherwise the clock
          * grid would just be traded for a coarser one.
          *
-         * Offsets are drawn from [0, 2*spread] rather than [-spread, +spread]:
-         * a note can't be emitted in the past, and the constant few-ms latency
-         * this adds is imperceptible.
+         * Drift is bounded to twice the spread. A positive spread is added,
+         * and negative delays are clamped to zero: melodic delays can reach
+         * three times the spread.
          */
-        private void scheduleHumanised(List<PlayableNote> notes, int tick, long now) {
+        private void scheduleHumanised(int chord, long now) {
             // Nothing to schedule if no one can hear it: without this the
             // queue would fill and drain into an empty audience every tick.
-            if (notes.isEmpty() || listeners.isEmpty()) return;
+            int from = song.chordStart(chord), to = song.chordEnd(chord);
+            if (from == to || listeners.isEmpty()) return;
+            int tick = song.chordTick(chord);
+            long tickNanos = now - (long)((elapsedSeconds - song.getSecondsUpTo(tick)) * 1_000_000_000.0);
 
-            // Voice allocation happens at schedule time so the whole chord is
-            // still visible (emission is scattered note by note). Registering
-            // occupancy from "now" rather than each jittered due-time is fine:
-            // ring times dwarf the few-ms jitter.
-            notes = admitVoices(notes, now);
-            if (notes.isEmpty()) return;
-
-            double overshootTicks = Math.max(0, position - tick);
-            long tickNanos = now - (long) (overshootTicks
-                    / Math.max(0.001, currentTempo) * 1_000_000_000.0);
-
-            float chordGain = limiterGain(notes.size());
+            float chordGain = limiterGain(to - from);
             var random = java.util.concurrent.ThreadLocalRandom.current();
 
             // (A) One timing offset for the WHOLE chord, so notes struck
@@ -1235,46 +1471,44 @@ public class PlaybackManager implements Listener {
                 timingOffsetMs = 0;
             }
 
-            for (PlayableNote note : notes) {
-                // Percussion carries the beat: pull it back toward the grid so
-                // drums stay tight while melodic voices breathe.
-                double noteOffsetMs = timingOffsetMs
-                        * (isPercussion(note.instrument()) ? humanizePercussion : 1.0);
-                // A note can't play in the past; shift the whole range positive.
-                double delayMs = noteOffsetMs + spread;
-                long offset = (long) (Math.max(0, delayMs) * 1_000_000.0);
-                pending.add(new Scheduled(tickNanos + offset, note, chordGain));
+            long melody = tickNanos + (long) (Math.max(0, timingOffsetMs + spread) * 1_000_000.0);
+            long drums = tickNanos + (long) (Math.max(0, timingOffsetMs * humanizePercussion + spread) * 1_000_000.0);
+            if (melody == drums) {
+                pending.add(new Scheduled(melody, scheduledSequence++, from, to, chordGain, 0, voiceAllocation));
+            } else {
+                boolean hasMelody = false, hasDrums = false;
+                for (int i = from; i < to; i++) {
+                    if (isPercussion(song.noteInstrument(i))) hasDrums = true; else hasMelody = true;
+                }
+                if (hasMelody) pending.add(new Scheduled(melody, scheduledSequence++, from, to, chordGain, 1, voiceAllocation));
+                if (hasDrums) pending.add(new Scheduled(drums, scheduledSequence++, from, to, chordGain, 2, voiceAllocation));
             }
         }
 
-        private void drainPending(long now, List<Listener> snapshot, ResourcePackService pack) {
+        private void drainPending(long now, List<Listener> snapshot) {
             while (!pending.isEmpty() && pending.peek().dueNanos() <= now) {
                 Scheduled due = pending.poll();
-                emitNote(due.note(), due.chordGain(), snapshot, pack);
+                for (int position = due.from(); position < due.to(); position++) {
+                    int note = due.ordered() ? song.orderedNoteIndex(position) : position;
+                    boolean drum = isPercussion(song.noteInstrument(note));
+                    if (due.group() == 1 && drum || due.group() == 2 && !drum) continue;
+                    emitNote(note, due.chordGain(), snapshot);
+                }
             }
         }
 
-        /** Emits one tick's notes. Sound packets only — no world access. */
-        private void emit(List<PlayableNote> notes, List<Listener> snapshot,
-                          ResourcePackService pack, long now) {
-            if (notes.isEmpty() || snapshot.isEmpty()) return;
-
-            // Use the step's timestamp, not a fresh one: voice expiry and note
-            // scheduling must share a single time base within a step.
-            notes = admitVoices(notes, now);
-            if (notes.isEmpty()) return;
-
-            // One gain for the whole chord (the ADMITTED chord — that is what
-            // actually reaches the client's mixer), so its balance is kept
-            float chordGain = limiterGain(notes.size());
-            for (PlayableNote note : notes) {
-                emitNote(note, chordGain, snapshot, pack);
+        /** Reads a chord directly from compact storage, with no lists, note records or sorting. */
+        private void emitChord(int from, int to, List<Listener> snapshot) {
+            if (from == to || snapshot.isEmpty()) return;
+            float chordGain = limiterGain(to - from);
+            boolean ordered = voiceAllocation;
+            for (int position = from; position < to; position++) {
+                emitNote(ordered ? song.orderedNoteIndex(position) : position, chordGain, snapshot);
             }
         }
 
         /** Emits a single note to every listener. */
-        private void emitNote(PlayableNote note, float chordGain,
-                              List<Listener> snapshot, ResourcePackService pack) {
+        private void emitNote(int noteIndex, float chordGain, List<Listener> snapshot) {
             // Sampled once per note so every listener hears the same point on
             // the ramp and a single note cannot straddle two fade values.
             float fade = fadeGain(System.nanoTime());
@@ -1286,118 +1520,76 @@ public class PlaybackManager implements Listener {
                             .nextDouble(-humanizeVelocity, humanizeVelocity))
                     : 1f;
 
-            // Which sound to play depends only on the NOTE and the pack —
-            // not on the listener — so resolve it once here instead of
-            // repeating the map lookups for every listener of a broadcast.
-            final int octaveSlot = note.octave() + 3;
-            final String packKey;
-            if (note.isCustom()) {
-                int index = note.customIndex();
-                String key = customSoundKeys[index][octaveSlot];
-                // Missing variant (rate out of range) -> the base sound,
-                // i.e. the folded note.
-                if (key == null || !pack.hasEvent(customSoundEvents[index][octaveSlot])) {
-                    key = customSoundEvents[index][3] != null
-                            && pack.hasEvent(customSoundEvents[index][3])
-                            ? customSoundKeys[index][3] : null;
-                }
-                // Custom sounds exist only in the pack; with no usable event
-                // there is nothing any listener could hear.
-                if (key == null) return;
-                packKey = key;
-            } else if (note.octave() != 0
-                    && EXTENDED_SOUND_KEYS[note.instrument()][octaveSlot] != null
-                    // The pack skips variants whose sample rate would fall
-                    // outside the decodable range; fold those.
-                    && pack.hasEvent(EXTENDED_SOUND_EVENTS[note.instrument()][octaveSlot])) {
-                packKey = EXTENDED_SOUND_KEYS[note.instrument()][octaveSlot];
-            } else {
-                packKey = null;              // vanilla sound, or folded note
-            }
-            final boolean custom = note.isCustom();
-
+            int instrument = song.noteInstrument(noteIndex), octave = song.noteOctave(noteIndex);
+            int custom = song.noteCustomIndex(noteIndex);
+            float notePitch = song.notePitch(noteIndex), noteVolume = song.noteVolume(noteIndex), pan = song.notePan(noteIndex);
             for (Listener listener : snapshot) {
-                // A listener without the pack hears nothing for a custom
-                // instrument (the pre-song warning covered this case).
-                if (custom && !listener.extended()) continue;
-
-                org.bukkit.Location at = panLocation(listener.ear(), listener.right(), note.pan());
-                float volume = Math.min(1f,
-                        note.volume() * listener.volume() * chordGain * human * fade)
-                        * panVolumeCompensation(listener.right(), note.pan());
-                if (volume < AUDIBLE_FLOOR) continue;
-
-                String key = listener.extended() ? packKey : null;
-                if (followPlayer) {
-                    float attached = attachedVolume(volume, listener.eyeHeight());
-                    if (key != null) {
-                        listener.player().playSound(listener.player(), key,
-                                SoundCategory.RECORDS, attached, note.pitch());
-                    } else {
-                        listener.player().playSound(listener.player(),
-                                INSTRUMENT_SOUNDS[note.instrument()],
-                                SoundCategory.RECORDS, attached, note.pitch());
+                UUID id = listener.id();
+                String key = null;
+                double seconds = -1;
+                boolean shifted = false;
+                Map<String, Double> manifest = listener.eventSeconds();
+                if (custom >= 0) {
+                    int slot = octave + 3;
+                    String event = customSoundEvents[custom][slot];
+                    if (event != null) seconds = manifest.getOrDefault(event, -1.0);
+                    if (!(seconds > 0)) {
+                        slot = 3; event = customSoundEvents[custom][slot];
+                        seconds = event == null ? -1 : manifest.getOrDefault(event, -1.0);
                     }
-                } else if (key != null) {
-                    listener.player().playSound(at, key, SoundCategory.RECORDS,
-                            volume, note.pitch());
+                    if (!(seconds > 0)) continue;
+                    key = customSoundKeys[custom][slot];
+                    shifted = slot != 3;
                 } else {
-                    listener.player().playSound(at, INSTRUMENT_SOUNDS[note.instrument()],
-                            SoundCategory.RECORDS, volume, note.pitch());
+                    if (octave != 0) {
+                        String event = EXTENDED_SOUND_EVENTS[instrument][octave + 3];
+                        seconds = manifest.getOrDefault(event, -1.0);
+                        if (seconds > 0) { shifted = true; key = EXTENDED_SOUND_KEYS[instrument][octave + 3]; }
+                    }
+                    if (!(seconds > 0)) seconds = vanillaSeconds(instrument);
+                }
+                float runtimePitch = runtimePitch(notePitch, octave, shifted);
+                float volume = Math.min(1f, noteVolume * listener.volume() * chordGain * human * fade);
+                // At the default zero floor every positive-volume note is
+                // emitted; exact zero (or an invalid NaN) still consumes no
+                // client channel.
+                if (!(volume > 0f) || volume < audibleFloor) continue;
+                if (!(seconds > 0)) seconds = 1;
+                long now = System.nanoTime();
+                Voices voices = listener.voices();
+                // A hard stop serializes with one packet emission, never with an entire clock step.
+                synchronized (voices) {
+                    if (cancelled || !isBroadcast() && broadcastSession != null) continue;
+                    voices.expire(now);
+                    if (voiceAllocation && voices.ends.size() >= voiceCeiling) continue;
+                    long seed = java.util.concurrent.ThreadLocalRandom.current().nextLong();
+                    if (followPlayer) {
+                        float attached = attachedVolume(volume, listener.eyeHeight());
+                        if (key != null) listener.player().playSound(listener.player(), key, SoundCategory.RECORDS, attached, runtimePitch, seed);
+                        else listener.player().playSound(listener.player(), INSTRUMENT_SOUNDS[instrument], SoundCategory.RECORDS, attached, runtimePitch, seed);
+                    } else {
+                        org.bukkit.Location at = panLocation(listener, pan, now);
+                        // A panned note sits pan-distance away; send the volume
+                        // that arrives at the intended gain over that distance.
+                        float placed = attachedVolume(volume, listener.forward() != null && pan != 0f ? panDistance : 0);
+                        if (key != null) listener.player().playSound(at, key, SoundCategory.RECORDS, placed, runtimePitch, seed);
+                        else listener.player().playSound(at, INSTRUMENT_SOUNDS[instrument], SoundCategory.RECORDS, placed, runtimePitch, seed);
+                    }
+                    if (voices.ends.size() >= 8192) voices.ends.poll();
+                    voices.ends.add(new Voice(now + (long)(seconds / Math.max(.5, runtimePitch) * 1_000_000_000L),
+                            voiceOwner, isBroadcast(), key != null ? key : INSTRUMENT_SOUNDS[instrument]));
                 }
             }
         }
-
-        /**
-         * How long this note will hold a client channel. Rate-shifted octave
-         * variants play 2^octave faster, and the runtime pitch (0.5-2.0)
-         * scales playback speed again — both shorten or lengthen the hold.
-         */
-        private double ringSeconds(PlayableNote note) {
-            // isCustom() already guarantees customIndex >= 0; only the upper
-            // bound needs checking (customRing is sized from the song's own
-            // sound list, which a stale cache entry could disagree with).
-            double base = note.isCustom()
-                    ? (customRing != null && note.customIndex() < customRing.length
-                            ? customRing[note.customIndex()] : -1)
-                    : (vanillaRing != null ? vanillaRing[note.instrument()] : -1);
-            if (base <= 0) base = 1.0;   // unmeasured: a typical note block ring
-            return base / Math.pow(2, note.octave()) / Math.max(0.25, note.pitch());
+        private static float runtimePitch(float pitch, int octave, boolean shifted) {
+            if (shifted || octave == 0) return pitch;
+            double folded = Math.scalb((double) pitch, octave);
+            return (float) Math.max(0.5, Math.min(2.0, folded));
         }
-
-        /**
-         * Admits as much of a chord as the voice ceiling allows.
-         *
-         * Occupancy is real, not per-tick: expired voices are released by
-         * their measured ring time, so a sparse song never comes near the
-         * ceiling and is never touched. When a chord genuinely would overflow
-         * it, the quietest notes are dropped — a deliberate choice, instead
-         * of the client evicting arbitrary sounds (possibly the melody, or
-         * the game's own audio) when its global pool fills.
-         */
-        private List<PlayableNote> admitVoices(List<PlayableNote> notes, long now) {
-            if (!voiceAllocation || notes.isEmpty()) return notes;
-
-            while (!ringing.isEmpty() && ringing.peek() <= now) {
-                ringing.poll();
-            }
-            int available = voiceCeiling - ringing.size();
-            List<PlayableNote> admitted;
-            if (notes.size() <= available) {
-                admitted = notes;
-            } else if (available <= 0) {
-                return List.of();
-            } else {
-                List<PlayableNote> byVolume = new ArrayList<>(notes);
-                byVolume.sort((a, b) -> Float.compare(b.volume(), a.volume()));
-                admitted = byVolume.subList(0, available);
-            }
-            for (PlayableNote note : admitted) {
-                ringing.add(now + (long) (ringSeconds(note) * 1_000_000_000.0));
-            }
-            return admitted;
+        private double vanillaSeconds(int instrument) {
+            double[] current = vanillaRingCache;
+            return current == null || instrument >= current.length ? -1 : current[instrument];
         }
-
         /**
          * Starts the ramp down. Returns false if fading is disabled or already
          * under way, so a second /nbw stop cuts immediately rather than
@@ -1428,7 +1620,7 @@ public class PlaybackManager implements Listener {
         private boolean shouldLoop() {
             if (!respectLoop || !song.isLoopEnabled()) return false;
             // An empty song would otherwise "loop" every step forever
-            if (song.getLengthTicks() <= 0) return false;
+            if (song.getNoteCount() == 0) return false;
             int max = song.getMaxLoopCount();
             // The NBS field is the number of times the song LOOPS, not the
             // number of times it plays: OpenNBS documents it as "the amount of
@@ -1441,11 +1633,10 @@ public class PlaybackManager implements Listener {
         /** Jumps back to the song's loop start, restoring the tempo there. */
         private void restartLoop() {
             loopsDone++;
-            pending.clear();
             timingOffsetMs = 0;
-            int start = song.getLoopStartTick();
+            int start = Math.max(0, Math.min(song.getLengthTicks(), song.getLoopStartTick()));
             position = start;
-            lastPlayedTick = start - 1;
+            nextChord = song.firstChordAfter(start - 1);
             elapsedSeconds = song.getSecondsUpTo(start);
             // A tempo changer earlier in the song may have altered the tempo;
             // resume with whatever is in effect at the loop point.
@@ -1461,21 +1652,33 @@ public class PlaybackManager implements Listener {
             if (finishing) return;
             finishing = true;
             cancelled = true;             // stop stepping immediately
-            Bukkit.getScheduler().runTask(plugin, this::finish);
+            plugin.runMain(this::finish);
         }
 
         private void finish() {
             // Reached only by a natural ending or a completed fade — in both
             // cases the remaining notes should decay, not be chopped.
             if (isBroadcast()) {
-                if (broadcastSession == this) broadcastSession = null;
+                // A stale completion must not consume a newer session's queued selection.
+                if (broadcastSession != this) {
+                    cancelLettingRing();
+                    return;
+                }
+                broadcastSession = null;
                 cancelLettingRing();
-                plugin.getServer().sendMessage(plugin.getMessages().get("playback.finished"));
+                Runnable queued = queuedBroadcastStart;
+                queuedBroadcastStart = null;
+                if (queued != null) {
+                    queued.run();
+                } else if (fadeStartNanos == 0) {
+                    // A completed fade was a stop someone already confirmed.
+                    plugin.getServer().sendMessage(plugin.getMessages().get("playback.finished"));
+                }
             } else {
                 // Identity-checked, mirroring the broadcast branch above: a
                 // stale session finishing must not remove the song the player
                 // has since started.
-                sessions.remove(owner.getUniqueId(), this);
+                if (!sessions.remove(owner.getUniqueId(), this)) { cancelLettingRing(); return; }
                 cancelLettingRing();
                 Runnable queued = queuedStarts.remove(owner.getUniqueId());
                 if (queued != null) {
@@ -1483,7 +1686,9 @@ public class PlaybackManager implements Listener {
                     // before "Now playing". The outgoing tail is left ringing
                     // and decays under the new song's opening.
                     if (owner.isOnline()) queued.run();
-                } else if (owner.isOnline()) {
+                } else if (owner.isOnline() && fadeStartNanos == 0) {
+                    // Only a natural ending: a faded stop was already
+                    // answered with "Playback stopped".
                     owner.sendMessage(plugin.getMessages().get("playback.finished"));
                 }
             }
@@ -1502,10 +1707,7 @@ public class PlaybackManager implements Listener {
                     .append(messages.get("playback.bar-empty",
                             Placeholder.unparsed("chars", "\u25ac".repeat(barLength - filled))));
 
-            String title = song.getName().isBlank()
-                    ? PlainTextComponentSerializer.plainText()
-                            .serialize(messages.get("playback.untitled"))
-                    : song.getName();
+            String title = displayTitle(song, publicId);
 
             Component actionBar = messages.get("playback.actionbar",
                     Placeholder.unparsed("title", title),
@@ -1518,8 +1720,7 @@ public class PlaybackManager implements Listener {
             }
         }
 
-        /** Main thread. */
-        /** Ends the session and CUTS anything still ringing. */
+        /** Ends the session and cuts anything still ringing. Main thread. */
         void cancelQuietly() {
             cancel(true);
         }
@@ -1552,13 +1753,17 @@ public class PlaybackManager implements Listener {
                 ticker.cancel();
                 ticker = null;
             }
-            // We play in RECORDS only, so stopping that category stops exactly
-            // our notes -- when stopping is what's wanted.
-            for (Listener listener : listeners) {
-                if (cutRingingSound) {
-                    listener.player().stopSound(SoundCategory.RECORDS);
+            if (cutRingingSound) {
+                if (isBroadcast()) {
+                    for (UUID id : listenerVoices.keySet()) cutVoices(id, voice -> voice.owner() == voiceOwner);
+                } else {
+                    cutVoices(owner.getUniqueId(), voice -> voice.owner() == voiceOwner);
                 }
-                if (showActionBar) {
+            }
+            // Natural endings and completed fades leave sounds ringing.
+            for (Listener listener : listeners) {
+                if (showActionBar && (isBroadcast() ? broadcastSession == null || broadcastSession == this
+                        : sessions.get(owner.getUniqueId()) == null || sessions.get(owner.getUniqueId()) == this)) {
                     listener.player().sendActionBar(Component.empty());
                 }
             }

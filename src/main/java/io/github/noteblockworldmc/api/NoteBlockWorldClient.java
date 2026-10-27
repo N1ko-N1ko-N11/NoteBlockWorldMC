@@ -3,6 +3,7 @@ package io.github.noteblockworldmc.api;
 import com.google.gson.Gson;
 import com.google.gson.reflect.TypeToken;
 import io.github.noteblockworldmc.api.model.SongPage;
+import io.github.noteblockworldmc.download.SecureUrlFetcher;
 
 import java.net.URI;
 import java.io.IOException;
@@ -15,6 +16,10 @@ import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
 /**
@@ -163,11 +168,39 @@ public class NoteBlockWorldClient {
     private final String userAgent;
     private final String baseUrl;
     private final HttpClient httpClient;
+    private final io.github.noteblockworldmc.util.BoundedHttp bounded;
+    /** Direct file downloads use the pinned-address fetcher, with bounded admission. */
+    private final ThreadPoolExecutor secureDownloads = new ThreadPoolExecutor(0, 4, 30,
+            TimeUnit.SECONDS, new java.util.concurrent.SynchronousQueue<>(), r -> {
+        Thread t = new Thread(r, "NoteblockWorldMC-download");
+        t.setDaemon(true);
+        return t;
+    }, new ThreadPoolExecutor.AbortPolicy());
+    private final java.util.Set<SecureUrlFetcher> activeSecureDownloads =
+            ConcurrentHashMap.newKeySet();
     private final Duration requestTimeout;
     private final Gson gson = new Gson();
 
     public NoteBlockWorldClient(String baseUrl, String pluginVersion,
                                 Duration connectTimeout, Duration requestTimeout) {
+        if (baseUrl == null || baseUrl.isBlank()) {
+            throw new IllegalArgumentException("api-base-url is required");
+        }
+        URI base;
+        try {
+            base = URI.create(baseUrl);
+        } catch (IllegalArgumentException e) {
+            throw new IllegalArgumentException("api-base-url is not a valid URI", e);
+        }
+        if (base.getHost() == null || !("https".equalsIgnoreCase(base.getScheme())
+                || "http".equalsIgnoreCase(base.getScheme()))
+                || base.getUserInfo() != null || base.getPort() == 0 || base.getPort() > 65535
+                || base.getRawQuery() != null || base.getRawFragment() != null
+                || connectTimeout == null || requestTimeout == null
+                || connectTimeout.isZero() || connectTimeout.isNegative()
+                || requestTimeout.isZero() || requestTimeout.isNegative()) {
+            throw new IllegalArgumentException("api-base-url must be an absolute HTTP(S) URL without a query or fragment");
+        }
         // Normalize: no trailing slash
         this.baseUrl = baseUrl.endsWith("/") ? baseUrl.substring(0, baseUrl.length() - 1) : baseUrl;
         // Derived, not hardcoded: a constant here sat at "/0.1" while the
@@ -178,10 +211,13 @@ public class NoteBlockWorldClient {
                 .connectTimeout(connectTimeout)
                 .followRedirects(HttpClient.Redirect.NORMAL)
                 .build();
+        this.bounded = new io.github.noteblockworldmc.util.BoundedHttp(httpClient);
     }
 
     /** Fetches a page of songs according to the given query. */
     public CompletableFuture<SongPage> fetchSongs(SongQuery query) {
+        if (query == null) return CompletableFuture.failedFuture(
+                new IllegalArgumentException("A song query is required"));
         Map<String, String> params = new LinkedHashMap<>();
 
         if (query.getQ() != null && !query.getQ().isBlank()) {
@@ -204,7 +240,11 @@ public class NoteBlockWorldClient {
         // The API validates limit with @Max(100); clamp so we never send an invalid value
         params.put("limit", String.valueOf(Math.min(100, Math.max(1, query.getLimit()))));
 
-        return getJson("/song" + toQueryString(params), SongPage.class);
+        return getJson("/song" + toQueryString(params), SongPage.class).thenApply(page -> {
+            if (page == null) throw new ApiException("API returned an empty song page");
+            page.getContent(); // validate records before handing the page to consumers
+            return page;
+        });
     }
 
     /**
@@ -251,7 +291,8 @@ public class NoteBlockWorldClient {
      * Called at startup and from /nbw reload, so the cache has exactly two
      * moments where it can change and an admin can always force one.
      */
-    public CompletableFuture<Map<String, Integer>> refreshCategories() {
+    public synchronized CompletableFuture<Map<String, Integer>> refreshCategories() {
+        if (categoryCache != null && !categoryCache.isDone()) return categoryCache;
         CompletableFuture<Map<String, Integer>> fresh = fetchCategoriesUncached();
         categoryCache = fresh;
         // A failed fetch must not become a permanently cached failure: clear
@@ -264,7 +305,7 @@ public class NoteBlockWorldClient {
     }
 
     /** Fetches available categories with their song counts. */
-    public CompletableFuture<Map<String, Integer>> fetchCategories() {
+    public synchronized CompletableFuture<Map<String, Integer>> fetchCategories() {
         CompletableFuture<Map<String, Integer>> cached = categoryCache;
         // An in-flight fetch is shared rather than duplicated, so several
         // players opening the GUI at once still produce one request.
@@ -272,9 +313,37 @@ public class NoteBlockWorldClient {
         return refreshCategories();
     }
 
+    static final int MAX_CATEGORIES = 100;
+
+    /**
+     * Category names go into chat, item names and a click-to-run command, so
+     * they get the same treatment as titles: no section signs or control
+     * characters, a sane length, and a bounded count.
+     */
+    static Map<String, Integer> cleanCategories(Map<String, Integer> raw) {
+        Map<String, Integer> clean = new LinkedHashMap<>();
+        for (Map.Entry<String, Integer> entry : raw.entrySet()) {
+            String name = entry.getKey();
+            if (name == null || name.isBlank() || name.length() > 64
+                    || !name.codePoints().allMatch(c -> c >= 32 && c != 127 && c != 0xA7
+                            && !Character.isISOControl(c) && Character.getType(c) != Character.FORMAT)) continue;
+            Integer count = entry.getValue();
+            clean.put(name.strip(), count == null || count < 0 ? 0 : count);
+            if (clean.size() == MAX_CATEGORIES) break;
+        }
+        return clean;
+    }
+
     private CompletableFuture<Map<String, Integer>> fetchCategoriesUncached() {
-        return getJsonRaw("/song/categories").thenApply(body ->
-                gson.fromJson(body, new TypeToken<Map<String, Integer>>() {}.getType()));
+        return getJsonRaw("/song/categories").thenApply(this::parseCategories);
+    }
+
+    Map<String, Integer> parseCategories(String body) {
+        Map<String, Integer> categories = gson.fromJson(body, new TypeToken<Map<String, Integer>>() {}.getType());
+        // A literal "null" body must fail like any other bad response, not
+        // complete successfully with nothing for callers to iterate.
+        if (categories == null) throw new ApiException("API returned no categories");
+        return cleanCategories(categories);
     }
 
     /**
@@ -286,6 +355,9 @@ public class NoteBlockWorldClient {
      * "Invalid source" otherwise). The response body is the URL as plain text.
      */
     public CompletableFuture<String> fetchOpenUrl(String publicId) {
+        if (publicId == null || !publicId.matches("[A-Za-z0-9_-]{1,80}")) {
+            return CompletableFuture.failedFuture(new IllegalArgumentException("Invalid song ID"));
+        }
         HttpRequest request = HttpRequest.newBuilder()
                 .uri(URI.create(baseUrl + "/song/" + encode(publicId) + "/open"))
                 .timeout(requestTimeout)
@@ -298,7 +370,7 @@ public class NoteBlockWorldClient {
         CompletableFuture<String> refusedOpen = refuseIfRateLimited();
         if (refusedOpen != null) return refusedOpen;
 
-        return httpClient.sendAsync(request, HttpResponse.BodyHandlers.ofString())
+        return bounded.send(request, 2 * 1024 * 1024, requestTimeout)
                 .thenApply(response -> {
                     if (isRateLimit(response.statusCode())) {
                         throw new ApiException(noteBackoff(response));
@@ -313,7 +385,7 @@ public class NoteBlockWorldClient {
                         throw new ApiException("API returned HTTP " + response.statusCode()
                                 + " while resolving the download URL");
                     }
-                    String body = response.body().trim();
+                    String body = new String(response.body(), StandardCharsets.UTF_8).trim();
                     // Defensive: strip quotes in case the body is JSON-encoded
                     if (body.length() >= 2 && body.startsWith("\"") && body.endsWith("\"")) {
                         body = body.substring(1, body.length() - 1);
@@ -330,62 +402,38 @@ public class NoteBlockWorldClient {
      * into memory, enforcing a size cap.
      */
     public CompletableFuture<byte[]> downloadFile(String url, long maxBytes) {
-        HttpRequest request = HttpRequest.newBuilder()
-                .uri(URI.create(url))
-                .timeout(Duration.ofSeconds(60))
-                .header("User-Agent", userAgent)
-                .GET()
-                .build();
-
-        // Stream to a byte[] but abort as soon as the cap is exceeded, so a
-        // hostile or misbehaving host can't OOM us by sending a huge body
-        // before we get to check its length.
-        CompletableFuture<byte[]> refusedDownload = refuseIfRateLimited();
-        if (refusedDownload != null) return refusedDownload;
-
-        return httpClient.sendAsync(request, HttpResponse.BodyHandlers.ofInputStream())
-                .thenApply(response -> {
-                    if (isRateLimit(response.statusCode())) {
-                        try {
-                            response.body().close();
-                        } catch (IOException ignored) {
-                            // best effort; the backoff matters more
-                        }
-                        throw new ApiException(noteBackoff(response));
-                    }
-                    if (response.statusCode() < 200 || response.statusCode() >= 300) {
-                        // The body is a live InputStream here (unlike the
-                        // ofString handlers): abandoning it on the error path
-                        // leaks the connection until GC.
-                        try {
-                            response.body().close();
-                        } catch (IOException ignored) {
-                            // closing best-effort; the status error matters more
-                        }
-                        throw new ApiException("File host returned HTTP " + response.statusCode());
-                    }
-                    try (var in = response.body()) {
-                        return readCapped(in, maxBytes);
-                    } catch (IOException e) {
-                        throw new ApiException("Download failed: " + e.getMessage(), e);
-                    }
-                });
-    }
-
-    /** Reads at most {@code maxBytes}, throwing if the stream exceeds it. */
-    private static byte[] readCapped(java.io.InputStream in, long maxBytes) throws IOException {
-        var out = new java.io.ByteArrayOutputStream();
-        byte[] buffer = new byte[8192];
-        long total = 0;
-        int read;
-        while ((read = in.read(buffer)) != -1) {
-            total += read;
-            if (total > maxBytes) {
-                throw new IOException("file exceeds the size limit of " + maxBytes + " bytes");
-            }
-            out.write(buffer, 0, read);
+        if (url == null || url.isBlank()) return CompletableFuture.failedFuture(
+                new IllegalArgumentException("A download URL is required"));
+        if (maxBytes <= 0) return CompletableFuture.failedFuture(
+                new IllegalArgumentException("Download size limit must be positive"));
+        // The signed URL is untrusted. The general HttpClient follows redirects
+        // and resolves DNS independently of validation, so it cannot safely be
+        // used for this hop. SecureUrlFetcher validates and pins every address
+        // on the socket that receives the bytes.
+        SecureUrlFetcher fetcher = new SecureUrlFetcher(maxBytes);
+        activeSecureDownloads.add(fetcher);
+        CompletableFuture<byte[]> result;
+        try {
+            result = CompletableFuture.supplyAsync(() -> {
+                try {
+                    return fetcher.fetch(url);
+                } catch (IOException e) {
+                    throw new java.util.concurrent.CompletionException(e);
+                } finally {
+                    activeSecureDownloads.remove(fetcher);
+                    fetcher.close();
+                }
+            }, secureDownloads);
+        } catch (RejectedExecutionException e) {
+            activeSecureDownloads.remove(fetcher);
+            fetcher.close();
+            return CompletableFuture.failedFuture(new IOException(
+                    "Download service busy or stopped; try again shortly", e));
         }
-        return out.toByteArray();
+        result.whenComplete((value, error) -> {
+            if (result.isCancelled()) fetcher.close();
+        });
+        return result;
     }
 
     // ------------------------------------------------------------------
@@ -415,7 +463,7 @@ public class NoteBlockWorldClient {
         CompletableFuture<String> refused = refuseIfRateLimited();
         if (refused != null) return refused;
 
-        return httpClient.sendAsync(request, HttpResponse.BodyHandlers.ofString())
+        return bounded.send(request, 2 * 1024 * 1024, requestTimeout)
                 .thenApply(response -> {
                     if (isRateLimit(response.statusCode())) {
                         throw new ApiException(noteBackoff(response));
@@ -424,7 +472,7 @@ public class NoteBlockWorldClient {
                         throw new ApiException("API returned HTTP " + response.statusCode()
                                 + " for " + path);
                     }
-                    return response.body();
+                    return new String(response.body(), StandardCharsets.UTF_8);
                 });
     }
 
@@ -456,13 +504,17 @@ public class NoteBlockWorldClient {
      * accepted, and anything unparseable falls back to a conservative default
      * rather than being ignored.
      */
-    private String noteBackoff(HttpResponse<?> response) {
+    private synchronized String noteBackoff(HttpResponse<?> response) {
         long seconds = response.headers().firstValue("Retry-After")
                 .map(NoteBlockWorldClient::parseRetryAfter)
                 .orElse(DEFAULT_BACKOFF_SECONDS);
         seconds = Math.max(1, Math.min(MAX_BACKOFF_SECONDS, seconds));
-        rateLimitedUntilNanos = System.nanoTime() + seconds * 1_000_000_000L;
-        return "noteblock.world is rate limiting requests; waiting " + seconds + "s";
+        long now = System.nanoTime();
+        long delay = seconds * 1_000_000_000L;
+        long remaining = rateLimitedUntilNanos == 0 ? 0 : rateLimitedUntilNanos - now;
+        // Concurrent responses may extend a cooldown, but cannot shorten it.
+        if (delay > remaining) rateLimitedUntilNanos = now + delay;
+        return "noteblock.world is rate limiting requests; waiting " + rateLimitSecondsRemaining() + "s";
     }
 
     /** Retry-After as delta-seconds or an HTTP date, in seconds from now. */
@@ -497,7 +549,14 @@ public class NoteBlockWorldClient {
 
     /** Releases the HTTP client's threads (call on plugin disable). */
     public void close() {
-        httpClient.close();
+        bounded.close();
+        activeSecureDownloads.forEach(SecureUrlFetcher::close);
+        secureDownloads.shutdownNow();
+    }
+
+    /** Retires this client after pending requests complete, without blocking reload. */
+    public void shutdown() {
+        close();
     }
 
     /** Thrown when the API responds with a non-2xx status. */

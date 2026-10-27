@@ -2,15 +2,8 @@ package io.github.noteblockworldmc.playback;
 
 import io.github.noteblockworldmc.NoteblockWorldMCPlugin;
 import io.github.noteblockworldmc.nbs.NbsSong;
-import io.github.noteblockworldmc.nbs.PlayableNote;
-import io.github.noteblockworldmc.pack.OggTools;
 
-import java.io.IOException;
-import java.nio.file.Files;
-import java.nio.file.Path;
 import java.util.Arrays;
-import java.util.HashMap;
-import java.util.List;
 import java.util.Map;
 
 /**
@@ -49,7 +42,7 @@ public final class PolyphonyAnalyzer {
                          int mergedNotes, int peakVoices, double peakAtSeconds,
                          double meanVoices, boolean estimated, int clientChannels,
                          double tempo, double minTempo, double maxTempo,
-                         double[] density) {
+                         double[] density, double observationSeconds, int excludedNotes, String scope) {
 
         /** Note Block Studio counts 4 ticks to a beat, so BPM = t/s * 15. */
         public double beatsPerMinute() {
@@ -84,89 +77,88 @@ public final class PolyphonyAnalyzer {
     private PolyphonyAnalyzer() {
     }
 
-    /** Blocking: run this off the main thread. */
+    /** One pass of arrangement demand before voice trimming, fades and humanization. */
     public static Report analyze(NoteblockWorldMCPlugin plugin, NbsSong song, String publicId) {
-        double[] vanillaLengths =
-                new double[io.github.noteblockworldmc.pack.ResourcePackService
-                        .INSTRUMENT_NAMES.length];
-        Arrays.fill(vanillaLengths, -1);
-        Map<Integer, Double> customLengths = customSampleLengths(plugin, song, publicId);
-
-        // Two flat arrays sized from the known note count, rather than a
-        // List<double[]>: a million notes meant a million 2-element arrays
-        // (~32 MB of headers alone) that were then copied into flat arrays
-        // anyway. The exact size is known up front, so allocate once.
-        int total = song.getNoteCount();
-        double[] starts = new double[total];
-        double[] ends = new double[total];
-        int n = 0;
-        // Whether any ring time had to be guessed rather than measured.
-        boolean estimated = false;
-
-        // Onset is tracked incrementally: calling getSecondsUpTo(tick) each
-        // iteration would re-walk the tempo map from zero every time --
-        // O(ticks^2), which the 10M-tick hard cap would turn into a hang.
-        double onset = 0;
-        double minTempo = NbsSong.clampTempo(song.getTempo());
-        double maxTempo = minTempo;
-        double tickSeconds = 1.0 / NbsSong.clampTempo(song.getTempo());
-        for (int tick = 0; tick <= song.getLengthTicks(); tick++) {
-            Double tempoChange = song.getTempoChangeAt(tick);
-            if (tempoChange != null) {
-                double changed = NbsSong.clampTempo(tempoChange);
-                tickSeconds = 1.0 / changed;
-                minTempo = Math.min(minTempo, changed);
-                maxTempo = Math.max(maxTempo, changed);
-            }
-            List<PlayableNote> notes = song.getNotesAt(tick);
-            if (notes.isEmpty()) {
-                onset += tickSeconds;
-                continue;
-            }
-            for (PlayableNote note : notes) {
-                double base;
-                if (note.isCustom()) {
-                    base = customLengths.getOrDefault(note.customIndex(), -1.0);
-                } else {
-                    int instrument = note.instrument();
-                    if (vanillaLengths[instrument] < 0) {
-                        double measured =
-                                plugin.getResourcePackService().sampleSeconds(instrument);
-                        // 0 marks "used but unreadable"; -1 stays "never used"
-                        vanillaLengths[instrument] = measured > 0 ? measured : 0;
-                    }
-                    base = vanillaLengths[instrument];
-                }
-                if (base <= 0) {
-                    // Measured directly at the point of use: inspecting the
-                    // length tables afterwards missed custom sounds whose
-                    // file was absent entirely (never entered in the map), so
-                    // a guessed report could claim to be exact.
-                    estimated = true;
-                    base = FALLBACK_SECONDS;
-                }
-
-                // An octave up plays the sample twice as fast: half as long,
-                // so it releases its channel twice as soon.
-                double ring = base / Math.pow(2, note.octave());
-                if (n < total) {
-                    starts[n] = onset;
-                    ends[n] = onset + Math.max(0.01, ring);
-                    n++;
-                }
-            }
-            onset += tickSeconds;
+        return analyze(plugin, song, publicId, null);
+    }
+    public static Report analyze(NoteblockWorldMCPlugin plugin, NbsSong song, String publicId, java.util.UUID listener) {
+        var pack = plugin.getResourcePackService();
+        Map<String, Double> manifest = pack.eventDurations(listener);
+        double[] vanilla = new double[io.github.noteblockworldmc.pack.ResourcePackService.INSTRUMENT_NAMES.length];
+        Arrays.fill(vanilla, -1);
+        int vanillaCount = vanilla.length;
+        Timing[][] timings = new Timing[vanillaCount + song.getCustomSoundFiles().size()][7];
+        String[] customBases = new String[song.getCustomSoundFiles().size()];
+        if (publicId != null) for (int i = 0; i < customBases.length; i++) {
+            if (song.getCustomNoteCount(i) > 0) customBases[i] = io.github.noteblockworldmc.pack.ResourcePackService
+                    .customSoundEvent(publicId, song.getCustomSoundFiles().get(i));
         }
+        float audibleFloor = PlaybackManager.configuredAudibleFloor(plugin);
+        int total = song.getNoteCount(), n = 0, excluded = 0;
+        double[] starts = new double[total], ends = new double[total];
+        boolean estimated = false;
+        for (int chord = 0; chord < song.chordCount(); chord++) {
+            if (Thread.currentThread().isInterrupted()) throw new java.util.concurrent.CancellationException();
+            double onset = song.getSecondsUpTo(song.chordTick(chord));
+            for (int note = song.chordStart(chord); note < song.chordEnd(chord); note++) {
+                float noteVolume = song.noteVolume(note);
+                if (!(noteVolume > 0f) || noteVolume < audibleFloor) { excluded++; continue; }
+                int custom = song.noteCustomIndex(note), instrument = song.noteInstrument(note), octave = song.noteOctave(note);
+                int row = custom >= 0 ? vanillaCount + custom : instrument;
+                Timing timing = timings[row][octave + 3];
+                if (timing == null) {
+                    timing = resolveTiming(pack, manifest, vanilla, instrument, octave, custom >= 0,
+                            custom >= 0 ? customBases[custom] : null);
+                    timings[row][octave + 3] = timing;
+                }
+                if (!timing.available()) { excluded++; continue; }
+                estimated |= timing.estimated();
+                float runtimePitch = runtimePitch(song.notePitch(note), octave, timing.shifted());
+                starts[n] = onset; ends[n] = onset + timing.seconds() / Math.max(.5, runtimePitch); n++;
+            }
+        }
+        return sweep(song, starts, ends, n, estimated, clientChannels(plugin), song.minTempo(), song.maxTempo(),
+                excluded, listener == null ? "current generated pack" : "your installed pack");
+    }
 
-        return sweep(song, starts, ends, n, estimated, clientChannels(plugin),
-                minTempo, maxTempo);
+    private record Timing(double seconds, boolean shifted, boolean available, boolean estimated) {}
+
+    /** At most one resolution per instrument/octave, regardless of how many notes use it. */
+    private static Timing resolveTiming(io.github.noteblockworldmc.pack.ResourcePackService pack,
+                                       Map<String, Double> manifest, double[] vanilla,
+                                       int instrument, int octave, boolean custom, String base) {
+        String suffix = octave == 0 ? "" : octave < 0 ? "_m" + -octave : "_p" + octave;
+        double seconds;
+        boolean shifted;
+        if (custom) {
+            if (base == null) return new Timing(-1, false, false, false);
+            seconds = manifest.getOrDefault(base + suffix, -1.0);
+            shifted = octave != 0 && seconds > 0;
+            if (!(seconds > 0)) seconds = manifest.getOrDefault(base, -1.0);
+            return new Timing(seconds, shifted, seconds > 0, false);
+        }
+        String event = io.github.noteblockworldmc.pack.ResourcePackService.INSTRUMENT_NAMES[instrument] + suffix;
+        seconds = octave == 0 ? -1 : manifest.getOrDefault(event, -1.0);
+        shifted = octave != 0 && seconds > 0;
+        if (!(seconds > 0)) {
+            if (vanilla[instrument] < 0) vanilla[instrument] = Math.max(0, pack.sampleSeconds(instrument));
+            seconds = vanilla[instrument];
+        }
+        boolean estimated = !(seconds > 0);
+        return new Timing(estimated ? FALLBACK_SECONDS : seconds, shifted, true, estimated);
+    }
+
+    private static float runtimePitch(float pitch, int octave, boolean shifted) {
+        if (shifted || octave == 0) return pitch;
+        double folded = Math.scalb((double) pitch, octave);
+        return (float) Math.max(0.5, Math.min(2.0, folded));
     }
 
     /** Peak overlap via a sorted start/end sweep. */
     private static Report sweep(NbsSong song, double[] starts, double[] ends,
                                 int count, boolean estimated, int clientChannels,
-                                double minTempo, double maxTempo) {
-        Arrays.sort(starts, 0, count);
+                                double minTempo, double maxTempo, int excluded, String scope) {
+        // Starts are already chronological because the compact chord table is ordered.
         Arrays.sort(ends, 0, count);
 
         int active = 0;
@@ -180,7 +172,7 @@ public final class PolyphonyAnalyzer {
         // Time-weighted voice count per slice, so the report can show WHERE
         // the song is busy rather than only how busy its worst instant is.
         double[] density = new double[DENSITY_BUCKETS];
-        double songSeconds = Math.max(0.001, song.getDurationSeconds());
+        double songSeconds = Math.max(0.001, Math.max(song.getDurationSeconds(), count == 0 ? 0 : ends[count-1]));
 
         // Run until every END is consumed, not merely every start. Stopping
         // at the last onset discarded the whole tail of the song -- all the
@@ -189,7 +181,7 @@ public final class PolyphonyAnalyzer {
         // wildly too low. Peak is unaffected (it only rises on a start).
         while (e < count) {
             double time;
-            if (s < count && starts[s] <= ends[e]) {
+            if (s < count && starts[s] < ends[e]) {
                 time = starts[s];
                 weighted += active * (time - lastTime);
                 addSpan(density, lastTime, time, active, songSeconds);
@@ -210,7 +202,7 @@ public final class PolyphonyAnalyzer {
             }
         }
 
-        double duration = Math.max(0.001, song.getDurationSeconds());
+        double duration = songSeconds;
         // Convert accumulated voice-seconds into an average voice count per slice
         double sliceSeconds = songSeconds / DENSITY_BUCKETS;
         for (int i = 0; i < density.length; i++) {
@@ -220,7 +212,7 @@ public final class PolyphonyAnalyzer {
         return new Report(song.getName(), song.getDurationSeconds(), count,
                 song.getMergedNotes(), peak, peakAt, weighted / duration, estimated,
                 clientChannels, NbsSong.clampTempo(song.getTempo()),
-                minTempo, maxTempo, density);
+                minTempo, maxTempo, density, songSeconds, excluded, scope);
     }
 
     /**
@@ -242,26 +234,4 @@ public final class PolyphonyAnalyzer {
     }
 
     /** Reads each custom instrument's sample length from the song's own files. */
-    static Map<Integer, Double> customSampleLengths(NoteblockWorldMCPlugin plugin,
-                                                            NbsSong song, String publicId) {
-        Map<Integer, Double> lengths = new HashMap<>();
-        if (publicId == null) return lengths;
-
-        Path soundsDir = plugin.getDownloadManager().getSongDirectory(publicId).resolve("sounds");
-        if (!Files.isDirectory(soundsDir)) return lengths;
-
-        List<String> files = song.getCustomSoundFiles();
-        for (int i = 0; i < files.size(); i++) {
-            String file = files.get(i);
-            if (file == null || file.isBlank()) continue;
-            Path path = soundsDir.resolve(Path.of(file).getFileName().toString());
-            if (!Files.isRegularFile(path)) continue;
-            try {
-                lengths.put(i, OggTools.readDurationSeconds(Files.readAllBytes(path)));
-            } catch (IOException ignored) {
-                // fall back to the estimate
-            }
-        }
-        return lengths;
-    }
 }

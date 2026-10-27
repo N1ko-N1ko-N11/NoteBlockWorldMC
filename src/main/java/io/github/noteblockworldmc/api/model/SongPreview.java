@@ -10,6 +10,8 @@ import java.util.regex.Pattern;
  */
 public class SongPreview {
 
+    private static final Pattern PUBLIC_ID = Pattern.compile("[A-Za-z0-9_-]{1,80}");
+
     @SerializedName("publicId")
     private String publicId;
 
@@ -66,35 +68,40 @@ public class SongPreview {
     /** The account that uploaded this song ("" if unknown). */
     public String getUploaderName() {
         return uploader == null || uploader.getUsername() == null
-                ? "" : uploader.getUsername();
+                ? "" : io.github.noteblockworldmc.util.Limits.display(uploader.getUsername());
     }
 
     public String getPublicId() {
         return publicId;
     }
 
+    /** Catalog records without a usable ID must never become selectable items. */
+    public boolean hasValidPublicId() {
+        return publicId != null && PUBLIC_ID.matcher(publicId).matches();
+    }
+
     public String getTitle() {
-        return title == null ? "" : sanitize(title);
+        return title == null ? "" : io.github.noteblockworldmc.util.Limits.display(sanitize(title));
     }
 
     /** Sanitized description, "" if the API omitted it (same contract as getTitle). */
     public String getDescription() {
-        return description == null ? "" : sanitize(description);
+        // Titles and authors already drop the section sign; descriptions kept
+        // it, so uploaded text could recolour or obfuscate (§k) lore and chat.
+        return description == null ? "" : sanitize(description.substring(0, Math.min(4096, description.length())))
+                .replace('\u00A7', ' ');
     }
 
-    /**
-     * Cleans text coming from the web API for safe rendering in Minecraft chat.
-     *
-     * - Normalizes Windows (\r\n) and old Mac (\r) line endings to \n.
-     *   Minecraft's font has no glyph for carriage return, so raw \r shows
-     *   up as a "[CR]" box in chat.
-     * - Strips all other control (Cc) and format (Cf) characters, e.g.
-     *   zero-width spaces, which also render as missing-glyph boxes.
-     */
     /** Precompiled: sanitize runs per title per GUI render and per search hit. */
     private static final Pattern STRIP_CONTROL =
             Pattern.compile("[[\\p{Cc}\\p{Cf}]&&[^\n]]");
 
+    /**
+     * Cleans text coming from the web API for safe rendering in Minecraft chat.
+     *
+     * Normalizes Windows (\r\n) and old Mac (\r) line endings to \n, then
+     * strips other control and format characters such as zero-width spaces.
+     */
     static String sanitize(String input) {
         if (input == null) return null;
         String normalized = input.replace("\r\n", "\n").replace('\r', '\n');
@@ -106,30 +113,30 @@ public class SongPreview {
      */
     public String getDisplayAuthor() {
         if (originalAuthor != null && !originalAuthor.isBlank()) {
-            return sanitize(originalAuthor);
+            return io.github.noteblockworldmc.util.Limits.display(sanitize(originalAuthor));
         }
         if (uploader != null && uploader.getUsername() != null) {
-            return sanitize(uploader.getUsername());
+            return io.github.noteblockworldmc.util.Limits.display(sanitize(uploader.getUsername()));
         }
         return "Unknown";
     }
 
     public double getDuration() {
-        return duration;
+        return Double.isFinite(duration) ? Math.max(0, duration) : 0;
     }
 
     /** Formats the duration as m:ss. */
     public String getFormattedDuration() {
-        int total = (int) Math.max(0, Math.round(duration));
+        int total = (int) Math.max(0, Math.round(getDuration()));
         return String.format("%d:%02d", total / 60, total % 60);
     }
 
     public int getNoteCount() {
-        return noteCount;
+        return Math.max(0, noteCount);
     }
 
     public int getPlayCount() {
-        return playCount;
+        return Math.max(0, playCount);
     }
 
 }

@@ -6,8 +6,8 @@ package io.github.noteblockworldmc.nbs;
  * @param instrument  vanilla instrument index (0-19), or -1 for a custom
  *                    instrument note
  * @param pitch       Minecraft sound pitch (0.5-2.0) for the folded key
- *                    (folded around 45 for vanilla, or around the custom
- *                    instrument's own base key)
+ *                    (folded around 45 for vanilla, or around 90 minus the custom
+ *                    instrument's declared key)
  * @param volume      0.0-1.0, layer volume and note velocity baked in
  * @param octave      octaves the real key sits outside the base window
  *                    (-3..+3); selects the extended-pack sound variant
@@ -28,12 +28,9 @@ public record PlayableNote(int instrument, float pitch, float volume, int octave
      * always sets the two together. Consumers should call this rather than
      * testing either field directly, so the two checks can never drift apart.
      *
-     * Deliberately no validation in a compact constructor: this record is
-     * materialized transiently by NbsSong.getNotesAt on the clock thread
-     * every tick (and millions of times during an analyze sweep), so
-     * per-instance checks would sit squarely in the hot path. The ranges are
-     * enforced once at parse time and again when NbsSong packs them into its
-     * narrow primitive arrays.
+     * The parser and the compatibility getNotesAt API use these records.
+     * Playback and analysis read NbsSong's primitive arrays directly. Ranges
+     * are enforced at parse time and when NbsSong packs the narrow arrays.
      */
     public boolean isCustom() {
         return customIndex >= 0;

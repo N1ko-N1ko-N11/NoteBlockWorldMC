@@ -21,29 +21,38 @@ public final class NbsSong {
      * component arrays. A worst-case song holds a million notes, and a
      * million PlayableNote records (object header, references, list slots —
      * ~48+ bytes each) costs several times the ~16 bytes/note these arrays
-     * do; with up to 16 songs in the playback LRU cache that difference is
-     * tens of megabytes. Records are materialized transiently by getNotesAt.
+     * do. Stable voice-order indices add up to four bytes per note when
+     * needed; playback and analysis traverse these arrays without records.
+     * getNotesAt remains available for callers that need a list.
      */
     private final int[] noteTicks;
     private final int[] noteStart;
+    /** Stable descending-volume indices; null when every chord is already ordered. */
+    private final int[] voiceOrder;
+    private final long estimatedRetainedBytes;
     private final byte[] noteInstrument;   // -1..19 fits a byte
     private final byte[] noteOctave;       // clamped -3..+3
     private final short[] noteCustomIndex; // -1..254
     private final float[] notePitch;
     private final float[] noteVolume;
     private final float[] notePan;
-    /** Notes skipped because they use custom instruments. */
+    /** Notes skipped because their custom instrument definition is unavailable. */
     private final int skippedCustomNotes;
     /** Notes dropped from ticks denser than the per-tick safety cap. */
     private final int skippedDenseNotes;
     /** Playable custom-instrument notes (need the server resource pack). */
     private final int customNoteCount;
+    /** Retained notes per custom instrument, after merging and density limits. */
+    private final int[] customNoteCounts;
     /** Duplicate notes folded into an existing note on the same tick. */
     private final int mergedNotes;
     /** Custom instruments' sound files, index-aligned ("" = none/consumed). */
     private final List<String> customSoundFiles;
     /** Mid-song tempo changes: tick -> new tempo (ticks/second). */
     private final TreeMap<Integer, Double> tempoChanges;
+    private final int[] tempoTicks;
+    private final double[] tempoSeconds, tempoRates;
+    private final double durationSeconds;
     /** Loop settings from the NBS header (v4+). */
     private final boolean loopEnabled;
     /** 0 = loop forever. */
@@ -52,12 +61,12 @@ public final class NbsSong {
 
     NbsSong(String name, String author, double tempo, int lengthTicks,
             Map<Integer, List<PlayableNote>> notesByTick, int skippedCustomNotes,
-            int skippedDenseNotes, int customNoteCount, int mergedNotes,
+            int skippedDenseNotes, int mergedNotes,
             List<String> customSoundFiles,
             TreeMap<Integer, Double> tempoChanges,
             boolean loopEnabled, int maxLoopCount, int loopStartTick) {
-        this.name = name;
-        this.author = author;
+        this.name = io.github.noteblockworldmc.util.Limits.display(name);
+        this.author = io.github.noteblockworldmc.util.Limits.display(author);
         this.tempo = tempo;
         this.lengthTicks = lengthTicks;
         // Flatten the parser's per-tick lists (kept there because the
@@ -75,6 +84,7 @@ public final class NbsSong {
         this.notePitch = new float[total];
         this.noteVolume = new float[total];
         this.notePan = new float[total];
+        this.customNoteCounts = new int[customSoundFiles.size()];
 
         // Sort primitives rather than a boxed Integer[]: an Integer[] sort
         // is TimSort with an unboxing comparison per step plus a temp array,
@@ -109,23 +119,59 @@ public final class NbsSong {
                 notePitch[noteIndex] = note.pitch();
                 noteVolume[noteIndex] = note.volume();
                 notePan[noteIndex] = note.pan();
+                if (note.isCustom()) customNoteCounts[note.customIndex()]++;
                 noteIndex++;
             }
         }
         noteStart[tickCount] = noteIndex;
+        int[] ordered = null;
+        for (int chord = 0; chord < tickCount; chord++) {
+            int from = noteStart[chord], to = noteStart[chord + 1];
+            for (int i = from + 1; i < to; i++) {
+                if (ordered == null) {
+                    if (noteVolume[i] <= noteVolume[i - 1]) continue;
+                    ordered = new int[total];
+                    for (int n = 0; n < total; n++) ordered[n] = n;
+                }
+                int current = ordered[i], j = i;
+                // Chords have at most 128 notes; equal volumes retain their original order.
+                while (j > from && noteVolume[ordered[j - 1]] < noteVolume[current]) {
+                    ordered[j] = ordered[j - 1]; j--;
+                }
+                ordered[j] = current;
+            }
+        }
+        voiceOrder = ordered;
         this.skippedCustomNotes = skippedCustomNotes;
         this.skippedDenseNotes = skippedDenseNotes;
-        this.customNoteCount = customNoteCount;
+        this.customNoteCount = java.util.Arrays.stream(customNoteCounts).sum();
         this.mergedNotes = mergedNotes;
         // Defensive: getCustomSoundFiles() hands this list to the pack
         // builder and the analyzer. The parser already passes a copy, but
         // enforcing it here means no future caller can alias a mutable list
         // into a cached, shared song.
         this.customSoundFiles = List.copyOf(customSoundFiles);
-        this.tempoChanges = tempoChanges;
+        this.tempoChanges = new TreeMap<>(tempoChanges);
+        TreeMap<Integer, Double> segments = new TreeMap<>(); segments.put(0, clampTempo(tempo));
+        tempoChanges.forEach((tick, rate) -> { if (tick >= 0 && tick <= lengthTicks) segments.put(tick, clampTempo(rate)); });
+        tempoTicks = new int[segments.size()]; tempoSeconds = new double[segments.size()]; tempoRates = new double[segments.size()];
+        int segment = 0;
+        for (var entry : segments.entrySet()) {
+            tempoTicks[segment] = entry.getKey(); tempoRates[segment] = entry.getValue();
+            if (segment > 0) tempoSeconds[segment] = tempoSeconds[segment-1]
+                    + (tempoTicks[segment] - tempoTicks[segment-1]) / tempoRates[segment-1];
+            segment++;
+        }
+        durationSeconds = getSecondsUpTo(lengthTicks + 1);
         this.loopEnabled = loopEnabled;
         this.maxLoopCount = maxLoopCount;
         this.loopStartTick = loopStartTick;
+        long retained = 512L + 16L * total + 4L * (noteTicks.length + noteStart.length + customNoteCounts.length)
+                + (voiceOrder == null ? 0 : 4L * voiceOrder.length)
+                + 20L * tempoTicks.length + 96L * this.tempoChanges.size()
+                + 2L * (this.name.length() + this.author.length());
+        for (String file : this.customSoundFiles) retained += 64L + 2L * file.length();
+        estimatedRetainedBytes = retained;
     }
 
     public boolean isLoopEnabled() {
@@ -155,23 +201,44 @@ public final class NbsSong {
 
     /** Seconds from the start of the song up to a tick, integrating tempo. */
     public double getSecondsUpTo(int tick) {
-        double currentTempo = clampTempo(tempo);
-        double seconds = 0;
-        int lastTick = 0;
-        for (Map.Entry<Integer, Double> change : tempoChanges.entrySet()) {
-            int changeTick = change.getKey();
-            if (changeTick > tick) break;
-            if (changeTick > lastTick) {
-                seconds += (changeTick - lastTick) / currentTempo;
-                lastTick = changeTick;
-            }
-            currentTempo = clampTempo(change.getValue());
-        }
-        seconds += (tick - lastTick) / currentTempo;
-        return seconds;
+        int i = java.util.Arrays.binarySearch(tempoTicks, Math.max(0, tick));
+        if (i < 0) i = -i - 2;
+        return tempoSeconds[i] + (Math.max(0, tick) - tempoTicks[i]) / tempoRates[i];
     }
 
-    /** Clamps a tempo into the playable range, replacing garbage values. */
+    /** Inverse of the pre-integrated timeline, including fractional song ticks. */
+    public double positionAtSeconds(double seconds) {
+        int i = java.util.Arrays.binarySearch(tempoSeconds, Math.max(0, seconds));
+        if (i < 0) i = -i - 2;
+        return tempoTicks[i] + (Math.max(0, seconds) - tempoSeconds[i]) * tempoRates[i];
+    }
+    /** Index of the next occupied tick, avoiding scans through millions of silent ticks. */
+    public int nextNoteTick(int after) {
+        int i = java.util.Arrays.binarySearch(noteTicks, after);
+        i = i >= 0 ? i + 1 : -i - 1;
+        return i < noteTicks.length ? noteTicks[i] : Integer.MAX_VALUE;
+    }
+    /** Allocation-free chord and note access for playback and analysis. Arrays remain private. */
+    public int chordCount() { return noteTicks.length; }
+    public int chordTick(int chord) { return noteTicks[chord]; }
+    public int chordStart(int chord) { return noteStart[chord]; }
+    public int chordEnd(int chord) { return noteStart[chord + 1]; }
+    public int firstChordAfter(int tick) {
+        int i = java.util.Arrays.binarySearch(noteTicks, tick);
+        return i >= 0 ? i + 1 : -i - 1;
+    }
+    public int orderedNoteIndex(int position) { return voiceOrder == null ? position : voiceOrder[position]; }
+    public int noteInstrument(int index) { return noteInstrument[index]; }
+    public int noteOctave(int index) { return noteOctave[index]; }
+    public int noteCustomIndex(int index) { return noteCustomIndex[index]; }
+    public float notePitch(int index) { return notePitch[index]; }
+    public float noteVolume(int index) { return noteVolume[index]; }
+    public float notePan(int index) { return notePan[index]; }
+    /** Conservative cache weight, including primitive storage, strings and tempo-map nodes. */
+    public long estimatedRetainedBytes() { return estimatedRetainedBytes; }
+    public double minTempo() { return java.util.Arrays.stream(tempoRates).min().orElse(tempo); }
+    public double maxTempo() { return java.util.Arrays.stream(tempoRates).max().orElse(tempo); }
+
     /**
      * Keeps a tempo inside the range songs can legitimately use.
      *
@@ -185,7 +252,7 @@ public final class NbsSong {
      * needs to be well below that for the timing to be meaningful.
      */
     public static double clampTempo(double tempo) {
-        if (tempo <= 0 || Double.isNaN(tempo)) return 10.0;
+        if (tempo <= 0 || !Double.isFinite(tempo)) return 10.0;
         return Math.max(0.2, Math.min(180.0, tempo));
     }
 
@@ -215,26 +282,12 @@ public final class NbsSong {
      * segment (a constant-tempo estimate is wrong for tempo-changer songs).
      */
     public double getDurationSeconds() {
-        double currentTempo = clampTempo(tempo);
-        double seconds = 0;
-        int lastTick = 0;
-        for (Map.Entry<Integer, Double> change : tempoChanges.entrySet()) {
-            int tick = change.getKey();
-            if (tick > lengthTicks) break;
-            if (tick > lastTick) {
-                seconds += (tick - lastTick) / currentTempo;
-                lastTick = tick;
-            }
-            currentTempo = clampTempo(change.getValue());
-        }
-        seconds += (lengthTicks + 1 - lastTick) / currentTempo;
-        return seconds;
+        return durationSeconds;
     }
 
     /**
-     * The notes starting at a tick. Records are built transiently from the
-     * flat arrays — a handful of short-lived young-gen objects per audible
-     * tick, in exchange for the several-times-smaller cached footprint.
+     * Compatibility list of the notes starting at a tick, in original order.
+     * Performance-sensitive callers use the chord ranges and indexed getters.
      */
     public List<PlayableNote> getNotesAt(int tick) {
         int i = java.util.Arrays.binarySearch(noteTicks, tick);
@@ -260,6 +313,10 @@ public final class NbsSong {
     /** Playable custom-instrument notes (audible only with the pack). */
     public int getCustomNoteCount() {
         return customNoteCount;
+    }
+
+    public int getCustomNoteCount(int instrumentIndex) {
+        return customNoteCounts[instrumentIndex];
     }
 
     public int getMergedNotes() {

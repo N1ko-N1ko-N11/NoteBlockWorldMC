@@ -6,13 +6,13 @@
 
     <groupId>io.github.NoteBlockWorldMC</groupId>
     <artifactId>noteblockworldmc</artifactId>
-    <version>1.0.0</version>
+    <version>1.1.0</version>
     <packaging>jar</packaging>
 
     <name>NoteblockWorldMC</name>
 
     <properties>
-        <!-- Paper 26.1.x targets Java 25 -->
+        <!-- Compile against Java 25; the resource-pack format is configured separately. -->
         <maven.compiler.release>25</maven.compiler.release>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     </properties>
@@ -25,21 +25,24 @@
     </repositories>
 
     <dependencies>
-        <!--
-            Paper API for Minecraft 26.1.2.
-            The open range resolves the latest build for this MC version;
-            pin a specific one (e.g. 26.1.2.build.74-stable) for reproducible builds.
-            Gson and the Adventure text API ship with Paper at runtime.
-        -->
+        <!-- Paper supplies Gson and Adventure at runtime. The API build is pinned for reproducible dependency selection. -->
         <dependency>
             <groupId>io.papermc.paper</groupId>
             <artifactId>paper-api</artifactId>
-            <version>[26.1.2.build,)</version>
+            <version>26.3.build.219-stable</version>
             <scope>provided</scope>
         </dependency>
     </dependencies>
 
     <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <version>3.16.0</version>
+                <configuration><release>25</release></configuration>
+            </plugin>
+        </plugins>
         <finalName>NoteblockWorldMC</finalName>
         <resources>
             <resource>
